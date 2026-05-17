@@ -17,36 +17,39 @@ use agent_client_protocol::{
         PlanEntryStatus, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
         RequestPermissionResponse, ResourceLink, SelectedPermissionOutcome, SessionConfigId,
         SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
-        SessionConfigSelectOption, SessionConfigValueId, SessionId, SessionMode, SessionModeId,
-        SessionModeState, SessionModelState, SessionNotification, SessionUpdate, StopReason,
-        Terminal, TextContent, TextResourceContents, ToolCall, ToolCallContent, ToolCallId,
-        ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
-        UnstructuredCommandInput, UsageUpdate,
+        SessionConfigSelectOption, SessionConfigValueId, SessionId, SessionInfoUpdate, SessionMode,
+        SessionModeId, SessionModeState, SessionModelState, SessionNotification, SessionUpdate,
+        StopReason, Terminal, TextContent, TextResourceContents, ToolCall, ToolCallContent,
+        ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+        ToolKind, UnstructuredCommandInput, UsageUpdate,
     },
 };
 use codex_apply_patch::parse_patch;
 use codex_core::{
-    CodexThread,
+    CodexThread, ModelClient, Prompt, ResponseEvent,
     config::{Config, set_project_trust_level},
+    resolve_installation_id,
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
 };
 use codex_login::auth::AuthManager;
 use codex_models_manager::manager::{ModelsManager, RefreshStrategy};
+use codex_otel::SessionTelemetry;
 use codex_protocol::{
+    SessionId as CodexSessionId, ThreadId as CodexThreadId,
     approvals::{
         ElicitationRequest, ElicitationRequestEvent, GuardianAssessmentAction,
         GuardianCommandSource,
     },
-    config_types::TrustLevel,
+    config_types::{ReasoningSummary, TrustLevel},
     dynamic_tools::{DynamicToolCallOutputContentItem, DynamicToolCallRequest},
     error::CodexErr,
     mcp::CallToolResult,
     models::{
-        ActivePermissionProfile, AdditionalPermissionProfile, PermissionProfile, ResponseItem,
-        WebSearchAction,
+        ActivePermissionProfile, AdditionalPermissionProfile, ContentItem, PermissionProfile,
+        ResponseItem, WebSearchAction,
     },
-    openai_models::{ModelPreset, ReasoningEffort},
+    openai_models::{ModelInfo as CodexModelInfo, ModelPreset, ReasoningEffort},
     parse_command::ParsedCommand,
     permissions::{
         FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry, FileSystemSpecialPath,
@@ -64,9 +67,9 @@ use codex_protocol::{
         ModelRerouteEvent, NetworkApprovalContext, NetworkPolicyRuleAction, Op,
         PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, PatchApplyUpdatedEvent,
         ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision,
-        ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem, StreamErrorEvent,
-        TerminalInteractionEvent, ThreadGoalStatus, ThreadGoalUpdatedEvent, TokenCountEvent,
-        TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
+        ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem, SessionSource,
+        StreamErrorEvent, TerminalInteractionEvent, ThreadGoalStatus, ThreadGoalUpdatedEvent,
+        TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
         ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
     request_permissions::{
@@ -75,8 +78,11 @@ use codex_protocol::{
     },
     user_input::UserInput,
 };
+use codex_rollout_trace::InferenceTraceContext;
 use codex_shell_command::parse_command::parse_command;
+use codex_thread_store::ThreadMetadataPatch;
 use codex_utils_approval_presets::{ApprovalPreset, builtin_approval_presets};
+use futures::StreamExt;
 use heck::ToTitleCase;
 use itertools::Itertools;
 use serde_json::json;
@@ -115,6 +121,18 @@ const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
 const CODEX_READ_ONLY_PROFILE_ID: &str = ":read-only";
 const CODEX_WORKSPACE_PROFILE_ID: &str = ":workspace";
 const CODEX_DANGER_NO_SANDBOX_PROFILE_ID: &str = ":danger-no-sandbox";
+const SESSION_TITLE_MAX_CHARS: usize = 60;
+const SESSION_TITLE_GENERATION_TIMEOUT: Duration = Duration::from_secs(20);
+const SESSION_TITLE_PROMPT_MAX_CHARS: usize = 4_000;
+const SESSION_TITLE_INSTRUCTIONS: &str = r#"Generate a concise title for this coding session.
+
+Rules:
+- Return only the title text.
+- Return the title in Simplified Chinese, even if the user wrote in another language.
+- Use a short Chinese phrase, roughly 6 to 12 Chinese characters when possible.
+- Do not quote the title.
+- Do not copy the user's request verbatim.
+- Keep technical identifiers like API, ACP, session/list, and file names unchanged when clearer."#;
 
 fn session_mode_id_for_active_profile(profile_id: &str) -> Option<&'static str> {
     match profile_id {
@@ -208,11 +226,24 @@ fn mode_trusts_project(mode_id: &str) -> bool {
     matches!(mode_id, "auto" | "full-access")
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ThreadTitleState {
+    name: Option<String>,
+    first_user_message: Option<String>,
+}
+
 /// Trait for abstracting over the `CodexThread` to make testing easier.
 pub trait CodexThreadImpl: Send + Sync {
     fn submit(&self, op: Op)
     -> Pin<Box<dyn Future<Output = Result<String, CodexErr>> + Send + '_>>;
     fn next_event(&self) -> Pin<Box<dyn Future<Output = Result<Event, CodexErr>> + Send + '_>>;
+    fn read_thread_title_state(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<ThreadTitleState>> + Send + '_>>;
+    fn set_thread_name(
+        &self,
+        name: String,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>>;
 }
 
 impl CodexThreadImpl for CodexThread {
@@ -226,6 +257,39 @@ impl CodexThreadImpl for CodexThread {
     fn next_event(&self) -> Pin<Box<dyn Future<Output = Result<Event, CodexErr>> + Send + '_>> {
         Box::pin(self.next_event())
     }
+
+    fn read_thread_title_state(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<ThreadTitleState>> + Send + '_>> {
+        Box::pin(async {
+            let thread = self
+                .read_thread(
+                    /*include_archived*/ true, /*include_history*/ false,
+                )
+                .await?;
+            Ok(ThreadTitleState {
+                name: thread.name,
+                first_user_message: thread.first_user_message,
+            })
+        })
+    }
+
+    fn set_thread_name(
+        &self,
+        name: String,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
+        Box::pin(async move {
+            self.update_thread_metadata(
+                ThreadMetadataPatch {
+                    name: Some(name),
+                    ..Default::default()
+                },
+                /*include_archived*/ false,
+            )
+            .await?;
+            Ok(())
+        })
+    }
 }
 
 pub trait ModelsManagerImpl: Send + Sync {
@@ -233,6 +297,11 @@ pub trait ModelsManagerImpl: Send + Sync {
         &self,
         model_id: &Option<String>,
     ) -> Pin<Box<dyn Future<Output = String> + Send + '_>>;
+    fn get_model_info(
+        &self,
+        model: &str,
+        config: &Config,
+    ) -> Pin<Box<dyn Future<Output = CodexModelInfo> + Send + '_>>;
     fn list_models(&self) -> Pin<Box<dyn Future<Output = Vec<ModelPreset>> + Send + '_>>;
 }
 
@@ -248,9 +317,143 @@ impl ModelsManagerImpl for Arc<dyn ModelsManager> {
         })
     }
 
+    fn get_model_info(
+        &self,
+        model: &str,
+        config: &Config,
+    ) -> Pin<Box<dyn Future<Output = CodexModelInfo> + Send + '_>> {
+        let model = model.to_string();
+        let manager_config = config.to_models_manager_config();
+        Box::pin(async move {
+            ModelsManager::get_model_info(self.as_ref(), &model, &manager_config).await
+        })
+    }
+
     fn list_models(&self) -> Pin<Box<dyn Future<Output = Vec<ModelPreset>> + Send + '_>> {
         Box::pin(async move {
             ModelsManager::list_models(self.as_ref(), RefreshStrategy::OnlineIfUncached).await
+        })
+    }
+}
+
+trait SessionTitleGenerator: Send + Sync {
+    fn generate_title(
+        &self,
+        session_id: &SessionId,
+        prompt_text: &str,
+        response_text: Option<&str>,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<String>>> + Send + '_>>;
+}
+
+struct ModelSessionTitleGenerator {
+    auth: Arc<AuthManager>,
+    models_manager: Arc<dyn ModelsManagerImpl>,
+    config: Config,
+}
+
+impl ModelSessionTitleGenerator {
+    fn new(
+        auth: Arc<AuthManager>,
+        models_manager: Arc<dyn ModelsManagerImpl>,
+        config: Config,
+    ) -> Self {
+        Self {
+            auth,
+            models_manager,
+            config,
+        }
+    }
+}
+
+impl SessionTitleGenerator for ModelSessionTitleGenerator {
+    fn generate_title(
+        &self,
+        session_id: &SessionId,
+        prompt_text: &str,
+        response_text: Option<&str>,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<String>>> + Send + '_>> {
+        let session_id = session_id.0.to_string();
+        let prompt_text = prompt_text.to_string();
+        let response_text = response_text.map(ToOwned::to_owned);
+
+        Box::pin(async move {
+            let thread_id = CodexThreadId::from_string(&session_id)?;
+            let codex_session_id = CodexSessionId::from(thread_id);
+            let model = self.models_manager.get_model(&self.config.model).await;
+            let model_info = self
+                .models_manager
+                .get_model_info(&model, &self.config)
+                .await;
+            let installation_id = resolve_installation_id(&self.config.codex_home).await?;
+            let model_client = ModelClient::new(
+                Some(self.auth.clone()),
+                codex_session_id,
+                thread_id,
+                installation_id,
+                self.config.model_provider.clone(),
+                SessionSource::Custom("codex-acp-title".to_string()),
+                self.config.model_verbosity,
+                /*enable_request_compression*/ false,
+                /*include_timing_metrics*/ false,
+                /*beta_features_header*/ None,
+            );
+
+            let telemetry = SessionTelemetry::new(
+                thread_id,
+                model.as_str(),
+                model_info.slug.as_str(),
+                /*account_id*/ None,
+                /*account_email*/ None,
+                /*auth_mode*/ None,
+                "codex-acp".to_string(),
+                /*log_user_prompts*/ false,
+                "acp".to_string(),
+                SessionSource::Custom("codex-acp-title".to_string()),
+            );
+
+            let mut prompt = Prompt::default();
+            prompt.input = vec![ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: build_session_title_prompt(&prompt_text, response_text.as_deref()),
+                }],
+                phase: None,
+            }];
+
+            let mut session = model_client.new_session();
+            let mut stream = session
+                .stream(
+                    &prompt,
+                    &model_info,
+                    &telemetry,
+                    /*effort*/ None,
+                    ReasoningSummary::None,
+                    self.config.service_tier.clone(),
+                    /*turn_metadata_header*/ None,
+                    &InferenceTraceContext::disabled(),
+                )
+                .await?;
+
+            let mut title = String::new();
+            while let Some(event) = stream.next().await {
+                match event? {
+                    ResponseEvent::OutputTextDelta(delta) => title.push_str(&delta),
+                    ResponseEvent::OutputItemDone(ResponseItem::Message { content, .. }) => {
+                        if title.trim().is_empty() {
+                            for item in content {
+                                if let ContentItem::OutputText { text } = item {
+                                    title.push_str(&text);
+                                }
+                            }
+                        }
+                    }
+                    ResponseEvent::Completed { .. } => break,
+                    _ => {}
+                }
+            }
+
+            Ok(normalize_session_title(&title, Some(&prompt_text)))
         })
     }
 }
@@ -330,6 +533,11 @@ impl Thread {
     ) -> Self {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
         let (resolution_tx, resolution_rx) = mpsc::unbounded_channel();
+        let title_generator = Arc::new(ModelSessionTitleGenerator::new(
+            auth.clone(),
+            models_manager.clone(),
+            config.clone(),
+        ));
 
         let actor = ThreadActor::new(
             auth,
@@ -337,6 +545,7 @@ impl Thread {
             thread.clone(),
             models_manager,
             config,
+            Some(title_generator),
             message_rx,
             resolution_tx,
             resolution_rx,
@@ -852,39 +1061,53 @@ struct ActiveCommand {
 
 struct PromptState {
     submission_id: String,
+    session_id: SessionId,
     active_commands: HashMap<String, ActiveCommand>,
     active_web_search: Option<String>,
     active_image_generations: HashSet<String>,
     active_guardian_assessments: HashSet<String>,
     thread: Arc<dyn CodexThreadImpl>,
+    session_title: Arc<Mutex<Option<String>>>,
+    title_generator: Option<Arc<dyn SessionTitleGenerator>>,
+    prompt_text: Option<String>,
     resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
     pending_permission_interactions: HashMap<String, PendingPermissionInteraction>,
     event_count: usize,
     response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
     seen_message_deltas: bool,
     seen_reasoning_deltas: bool,
+    agent_message_text: String,
 }
 
 impl PromptState {
     fn new(
         submission_id: String,
+        session_id: SessionId,
         thread: Arc<dyn CodexThreadImpl>,
+        session_title: Arc<Mutex<Option<String>>>,
+        title_generator: Option<Arc<dyn SessionTitleGenerator>>,
+        prompt_text: Option<String>,
         resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
         response_tx: oneshot::Sender<Result<StopReason, Error>>,
     ) -> Self {
         Self {
             submission_id,
+            session_id,
             active_commands: HashMap::new(),
             active_web_search: None,
             active_image_generations: HashSet::new(),
             active_guardian_assessments: HashSet::new(),
             thread,
+            session_title,
+            title_generator,
+            prompt_text,
             resolution_tx,
             pending_permission_interactions: HashMap::new(),
             event_count: 0,
             response_tx: Some(response_tx),
             seen_message_deltas: false,
             seen_reasoning_deltas: false,
+            agent_message_text: String::new(),
         }
     }
 
@@ -899,6 +1122,65 @@ impl PromptState {
         for (_, interaction) in self.pending_permission_interactions.drain() {
             interaction.task.abort();
         }
+    }
+
+    async fn maybe_publish_session_title(
+        &self,
+        client: &SessionClient,
+        response_text: Option<&str>,
+    ) {
+        if self.session_title.lock().unwrap().is_some() {
+            return;
+        }
+
+        let mut title_prompt = self.prompt_text.clone();
+        match self.thread.read_thread_title_state().await {
+            Ok(state) => {
+                if state.first_user_message.is_some() {
+                    title_prompt = state.first_user_message.clone();
+                }
+                if let Some(title) = state.name.as_deref().and_then(|name| {
+                    normalize_session_title(name, state.first_user_message.as_deref())
+                }) {
+                    publish_session_title(&self.session_title, client, title);
+                    return;
+                }
+            }
+            Err(err) => warn!("Failed to read thread name before title generation: {err}"),
+        }
+
+        let (Some(generator), Some(prompt_text)) = (
+            self.title_generator.as_ref(),
+            title_prompt
+                .as_deref()
+                .filter(|text| !text.trim().is_empty()),
+        ) else {
+            return;
+        };
+
+        let title = match tokio::time::timeout(
+            SESSION_TITLE_GENERATION_TIMEOUT,
+            generator.generate_title(&self.session_id, prompt_text, response_text),
+        )
+        .await
+        {
+            Ok(Ok(Some(title))) => title,
+            Ok(Ok(None)) => return,
+            Ok(Err(err)) => {
+                warn!("Failed to generate session title: {err}");
+                return;
+            }
+            Err(_) => {
+                warn!("Timed out generating session title");
+                return;
+            }
+        };
+
+        if let Err(err) = self.thread.set_thread_name(title.clone()).await {
+            warn!("Failed to persist generated thread name: {err}");
+        }
+
+        publish_session_title(&self.session_title, client, title);
     }
 
     fn spawn_permission_request(
@@ -1108,6 +1390,7 @@ impl PromptState {
                 collaboration_mode_kind,
                 turn_id,
                 started_at: _,
+                ..
             }) => {
                 info!("Task started with context window of {turn_id} {model_context_window:?} {collaboration_mode_kind:?}");
             }
@@ -1121,7 +1404,13 @@ impl PromptState {
                         )));
                     }
             }
-            EventMsg::ItemStarted(ItemStartedEvent { thread_id, turn_id, item , started_at_ms: _}) => {
+            EventMsg::ItemStarted(ItemStartedEvent {
+                thread_id,
+                turn_id,
+                item,
+                started_at_ms: _,
+                ..
+            }) => {
                 info!("Item started with thread_id: {thread_id}, turn_id: {turn_id}, item: {item:?}");
             }
             EventMsg::UserMessage(UserMessageEvent {
@@ -1129,6 +1418,7 @@ impl PromptState {
                 images: _,
                 text_elements: _,
                 local_images: _,
+                ..
             }) => {
                 info!("User message: {message:?}");
             }
@@ -1137,9 +1427,11 @@ impl PromptState {
                 turn_id,
                 item_id,
                 delta,
+                ..
             }) => {
                 info!("Agent message content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, delta: {delta:?}");
                 self.seen_message_deltas = true;
+                self.agent_message_text.push_str(&delta);
                 client.send_agent_text(delta);
             }
             EventMsg::ReasoningContentDelta(ReasoningContentDeltaEvent {
@@ -1148,6 +1440,7 @@ impl PromptState {
                 item_id,
                 delta,
                 summary_index: index,
+                ..
             })
             | EventMsg::ReasoningRawContentDelta(ReasoningRawContentDeltaEvent {
                 thread_id,
@@ -1155,6 +1448,7 @@ impl PromptState {
                 item_id,
                 delta,
                 content_index: index,
+                ..
             }) => {
                 info!("Agent reasoning content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, index: {index}, delta: {delta:?}");
                 self.seen_reasoning_deltas = true;
@@ -1163,20 +1457,29 @@ impl PromptState {
             EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent {
                 item_id,
                 summary_index,
+                ..
             }) => {
                 info!("Agent reasoning section break received:  item_id: {item_id}, index: {summary_index}");
                 // Make sure the section heading actually get spacing
                 self.seen_reasoning_deltas = true;
                 client.send_agent_thought("\n\n");
             }
-            EventMsg::AgentMessage(AgentMessageEvent { message , phase: _, memory_citation: _ }) => {
+            EventMsg::AgentMessage(AgentMessageEvent {
+                message,
+                phase: _,
+                memory_citation: _,
+                ..
+            }) => {
                 info!("Agent message (non-delta) received: {message:?}");
                 // We didn't receive this message via streaming
                 if !std::mem::take(&mut self.seen_message_deltas) {
+                    if self.agent_message_text.is_empty() {
+                        self.agent_message_text.push_str(&message);
+                    }
                     client.send_agent_text(message);
                 }
             }
-            EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
+            EventMsg::AgentReasoning(AgentReasoningEvent { text, .. }) => {
                 info!("Agent reasoning (non-delta) received: {text:?}");
                 // We didn't receive this message via streaming
                 if !std::mem::take(&mut self.seen_reasoning_deltas) {
@@ -1192,7 +1495,7 @@ impl PromptState {
                 info!("Agent plan updated. Explanation: {:?}", explanation);
                 client.update_plan(plan);
             }
-            EventMsg::WebSearchBegin(WebSearchBeginEvent { call_id }) => {
+            EventMsg::WebSearchBegin(WebSearchBeginEvent { call_id, .. }) => {
                 info!("Web search started: call_id={}", call_id);
                 // Create a ToolCall notification for the search beginning
                 self.start_web_search(client, call_id);
@@ -1201,6 +1504,7 @@ impl PromptState {
                 call_id,
                 query,
                 action,
+                ..
             }) => {
                 info!("Web search query received: call_id={call_id}, query={query}");
                 // Send update that the search is in progress with the query
@@ -1255,7 +1559,15 @@ impl PromptState {
                 );
                 self.terminal_interaction(client, event);
             }
-            EventMsg::DynamicToolCallRequest(DynamicToolCallRequest { call_id, turn_id, namespace, tool, arguments, started_at_ms: _ }) => {
+            EventMsg::DynamicToolCallRequest(DynamicToolCallRequest {
+                call_id,
+                turn_id,
+                namespace,
+                tool,
+                arguments,
+                started_at_ms: _,
+                ..
+            }) => {
                 info!("Dynamic tool call request: call_id={call_id}, turn_id={turn_id}, namespace={namespace:?}, tool={tool}");
                 self.start_dynamic_tool_call(client, call_id, tool, arguments);
             }
@@ -1269,7 +1581,8 @@ impl PromptState {
             EventMsg::McpToolCallBegin(McpToolCallBeginEvent {
                 call_id,
                 invocation,
-                mcp_app_resource_uri: _
+                mcp_app_resource_uri: _,
+                ..
             }) => {
                 info!(
                     "MCP tool call begin: call_id={call_id}, invocation={} {}",
@@ -1283,6 +1596,7 @@ impl PromptState {
                 duration,
                 result,
                 mcp_app_resource_uri: _,
+                ..
             }) => {
                 info!(
                     "MCP tool call ended: call_id={call_id}, invocation={} {}, duration={duration:?}",
@@ -1328,10 +1642,25 @@ impl PromptState {
                 turn_id,
                 item,
                 completed_at_ms: _,
+                ..
             }) => {
                 info!("Item completed: thread_id={}, turn_id={}, item={:?}", thread_id, turn_id, item);
             }
-            EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message, turn_id, completed_at: _, duration_ms: _, time_to_first_token_ms: _, }) => {
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                last_agent_message,
+                turn_id,
+                completed_at: _,
+                duration_ms: _,
+                time_to_first_token_ms: _,
+                ..
+            }) => {
+                self.maybe_publish_session_title(
+                    client,
+                    last_agent_message
+                        .as_deref()
+                        .or_else(|| non_empty_str(&self.agent_message_text)),
+                )
+                .await;
                 info!(
                     "Task {turn_id} completed successfully after {} events. Last agent message: {last_agent_message:?}",
                     self.event_count
@@ -1345,6 +1674,7 @@ impl PromptState {
                 message,
                 codex_error_info,
                 additional_details,
+                ..
             }) => {
                 error!(
                     "Handled error during turn: {message} {codex_error_info:?} {additional_details:?}"
@@ -1353,6 +1683,7 @@ impl PromptState {
             EventMsg::Error(ErrorEvent {
                 message,
                 codex_error_info,
+                ..
             }) => {
                 error!("Unhandled error during turn: {message} {codex_error_info:?}");
                 self.abort_pending_interactions();
@@ -1364,7 +1695,13 @@ impl PromptState {
                         .ok();
                 }
             }
-            EventMsg::TurnAborted(TurnAbortedEvent { reason, turn_id, completed_at: _, duration_ms: _ }) => {
+            EventMsg::TurnAborted(TurnAbortedEvent {
+                reason,
+                turn_id,
+                completed_at: _,
+                duration_ms: _,
+                ..
+            }) => {
                 info!("Turn {turn_id:?} aborted: {reason:?}");
                 self.abort_pending_interactions();
                 if let Some(response_tx) = self.response_tx.take() {
@@ -1378,7 +1715,7 @@ impl PromptState {
                     response_tx.send(Ok(StopReason::Cancelled)).ok();
                 }
             }
-            EventMsg::ViewImageToolCall(ViewImageToolCallEvent { call_id, path }) => {
+            EventMsg::ViewImageToolCall(ViewImageToolCallEvent { call_id, path, .. }) => {
                 info!("ViewImageToolCallEvent received");
                 let display_path = path.display().to_string();
                 client.send_notification(
@@ -1401,20 +1738,21 @@ impl PromptState {
                     drop(response_tx.send(Err(err)));
                 }
             }
-            EventMsg::Warning(WarningEvent { message })
-            | EventMsg::GuardianWarning(WarningEvent { message }) => {
+            EventMsg::Warning(WarningEvent { message, .. })
+            | EventMsg::GuardianWarning(WarningEvent { message, .. }) => {
                 warn!("Warning: {message}");
                 // Forward warnings to the client as agent messages so users see
                 // informational notices (e.g., the post-compact advisory message).
                 client.send_agent_text(message);
             }
-            EventMsg::McpStartupUpdate(McpStartupUpdateEvent { server, status }) => {
+            EventMsg::McpStartupUpdate(McpStartupUpdateEvent { server, status, .. }) => {
                 info!("MCP startup update: server={server}, status={status:?}");
             }
             EventMsg::McpStartupComplete(McpStartupCompleteEvent {
                 ready,
                 failed,
                 cancelled,
+                ..
             }) => {
                 info!(
                     "MCP startup complete: ready={ready:?}, failed={failed:?}, cancelled={cancelled:?}"
@@ -1428,7 +1766,12 @@ impl PromptState {
                     drop(response_tx.send(Err(err)));
                 }
             }
-            EventMsg::ModelReroute(ModelRerouteEvent { from_model, to_model, reason }) => {
+            EventMsg::ModelReroute(ModelRerouteEvent {
+                from_model,
+                to_model,
+                reason,
+                ..
+            }) => {
                 info!("Model reroute: from={from_model}, to={to_model}, reason={reason:?}");
             }
             EventMsg::ModelVerification(event) => {
@@ -1501,6 +1844,7 @@ impl PromptState {
             id,
             request,
             turn_id: _,
+            ..
         } = event;
         if let Some(supported_request) = build_supported_mcp_elicitation_permission_request(
             &server_name,
@@ -1595,6 +1939,7 @@ impl PromptState {
             // grant_root doesn't seem to be set anywhere on the codex side
             grant_root: _,
             turn_id: _,
+            ..
         } = event;
         let (title, locations, content) = extract_tool_call_content_from_changes(changes);
         let request_key = patch_request_key(&call_id);
@@ -1638,6 +1983,7 @@ impl PromptState {
             auto_approved: _,
             changes,
             turn_id: _,
+            ..
         } = event;
 
         let (title, locations, content) = extract_tool_call_content_from_changes(changes);
@@ -1654,7 +2000,9 @@ impl PromptState {
 
     fn update_patch_apply(&self, client: &SessionClient, event: PatchApplyUpdatedEvent) {
         let raw_input = serde_json::json!(&event);
-        let PatchApplyUpdatedEvent { call_id, changes } = event;
+        let PatchApplyUpdatedEvent {
+            call_id, changes, ..
+        } = event;
 
         if changes.is_empty() {
             return;
@@ -1684,6 +2032,7 @@ impl PromptState {
             changes,
             turn_id: _,
             status,
+            ..
         } = event;
 
         let (title, locations, content) = if !changes.is_empty() {
@@ -1751,6 +2100,7 @@ impl PromptState {
             success,
             error,
             duration: _,
+            ..
         } = event;
 
         client.send_tool_call_update(ToolCallUpdate::new(
@@ -1843,6 +2193,7 @@ impl PromptState {
             additional_permissions,
             available_decisions: _,
             proposed_network_policy_amendments,
+            ..
         } = event;
 
         // Create a new tool call for the command execution
@@ -1956,6 +2307,7 @@ impl PromptState {
             cwd,
             parsed_cmd,
             process_id: _,
+            ..
         } = event;
         // Create a new tool call for the command execution
         let tool_call_id = ToolCallId::new(call_id.clone());
@@ -2009,6 +2361,7 @@ impl PromptState {
             call_id,
             chunk,
             stream: _,
+            ..
         } = event;
         // Stream output bytes to the display-only terminal via ToolCallUpdate meta.
         if let Some(active_command) = self.active_commands.get_mut(&call_id) {
@@ -2056,6 +2409,7 @@ impl PromptState {
             process_id: _,
             completed_at_ms: _,
             status,
+            ..
         } = event;
         if let Some(active_command) = self.active_commands.remove(&call_id) {
             let is_success = exit_code == 0;
@@ -2114,6 +2468,7 @@ impl PromptState {
             call_id,
             process_id: _,
             stdin,
+            ..
         } = event;
 
         let stdin = format!("\n{stdin}\n");
@@ -2161,7 +2516,7 @@ impl PromptState {
 
     fn start_image_generation(&mut self, client: &SessionClient, event: ImageGenerationBeginEvent) {
         let raw_input = serde_json::json!(&event);
-        let ImageGenerationBeginEvent { call_id } = event;
+        let ImageGenerationBeginEvent { call_id, .. } = event;
         self.active_image_generations.insert(call_id.clone());
         client.send_tool_call(
             ToolCall::new(call_id, "Image generation")
@@ -2179,6 +2534,7 @@ impl PromptState {
             revised_prompt,
             result,
             saved_path,
+            ..
         } = event;
         let tool_status = image_generation_tool_status(&status);
         let saved_path = saved_path.map(|path| path.to_string_lossy().into_owned());
@@ -2262,6 +2618,7 @@ impl PromptState {
             reason,
             permissions,
             cwd: _,
+            ..
         } = event;
 
         // Create a new tool call for the command execution
@@ -2659,6 +3016,12 @@ impl SessionClient {
         )));
     }
 
+    fn send_session_title(&self, title: impl Into<String>) {
+        self.send_notification(SessionUpdate::SessionInfoUpdate(
+            SessionInfoUpdate::new().title(title.into()),
+        ));
+    }
+
     fn send_tool_call(&self, tool_call: ToolCall) {
         self.send_notification(SessionUpdate::ToolCall(tool_call));
     }
@@ -2751,6 +3114,10 @@ struct ThreadActor<A> {
     resolution_rx: mpsc::UnboundedReceiver<ThreadMessage>,
     /// Last config options state we emitted to the client, used for deduping updates.
     last_sent_config_options: Option<Vec<SessionConfigOption>>,
+    /// Last protocol-visible session title, if one has been provided.
+    session_title: Arc<Mutex<Option<String>>>,
+    /// Hidden LLM title generator used when Codex has not yet persisted a title.
+    title_generator: Option<Arc<dyn SessionTitleGenerator>>,
 }
 
 impl<A: Auth> ThreadActor<A> {
@@ -2761,6 +3128,7 @@ impl<A: Auth> ThreadActor<A> {
         thread: Arc<dyn CodexThreadImpl>,
         models_manager: Arc<dyn ModelsManagerImpl>,
         config: Config,
+        title_generator: Option<Arc<dyn SessionTitleGenerator>>,
         message_rx: mpsc::UnboundedReceiver<ThreadMessage>,
         resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
         resolution_rx: mpsc::UnboundedReceiver<ThreadMessage>,
@@ -2776,6 +3144,8 @@ impl<A: Auth> ThreadActor<A> {
             message_rx,
             resolution_rx,
             last_sent_config_options: None,
+            session_title: Arc::new(Mutex::new(None)),
+            title_generator,
         }
     }
 
@@ -3247,7 +3617,9 @@ impl<A: Auth> ThreadActor<A> {
     ) -> Result<oneshot::Receiver<Result<StopReason, Error>>, Error> {
         let (response_tx, response_rx) = oneshot::channel();
 
+        let session_id = request.session_id.clone();
         let items = build_prompt_items(request.prompt);
+        let prompt_text = prompt_text_from_items(&items);
         let op;
         if let Some((name, rest)) = extract_slash_command(&items) {
             match name {
@@ -3336,7 +3708,11 @@ impl<A: Auth> ThreadActor<A> {
 
         let state = SubmissionState::Prompt(PromptState::new(
             submission_id.clone(),
+            session_id,
             self.thread.clone(),
+            self.session_title.clone(),
+            self.title_generator.clone(),
+            prompt_text,
             self.resolution_tx.clone(),
             response_tx,
         ));
@@ -3801,12 +4177,107 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn handle_event(&mut self, Event { id, msg }: Event) {
+        let handled_globally = self.handle_global_event(&msg);
         if let Some(submission) = self.submissions.get_mut(&id) {
             submission.handle_event(&self.client, msg).await;
-        } else {
+        } else if !handled_globally {
             warn!("Received event for unknown submission ID: {id} {msg:?}");
         }
     }
+
+    fn handle_global_event(&mut self, msg: &EventMsg) -> bool {
+        if let EventMsg::SessionConfigured(event) = msg {
+            if let Some(title) = event
+                .thread_name
+                .as_deref()
+                .and_then(|title| normalize_session_title(title, None))
+            {
+                publish_session_title(&self.session_title, &self.client, title);
+            }
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn publish_session_title(
+    session_title: &Arc<Mutex<Option<String>>>,
+    client: &SessionClient,
+    title: String,
+) {
+    let mut current_title = session_title.lock().unwrap();
+    if current_title.as_deref() == Some(title.as_str()) {
+        return;
+    }
+    *current_title = Some(title.clone());
+    drop(current_title);
+    client.send_session_title(title);
+}
+
+fn non_empty_str(text: &str) -> Option<&str> {
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn build_session_title_prompt(prompt_text: &str, response_text: Option<&str>) -> String {
+    let prompt_text = truncate_for_title_prompt(prompt_text);
+    let response_text = response_text
+        .map(truncate_for_title_prompt)
+        .unwrap_or_default();
+    format!(
+        "{SESSION_TITLE_INSTRUCTIONS}\n\n<user_request>\n{prompt_text}\n</user_request>\n\n<assistant_response>\n{response_text}\n</assistant_response>"
+    )
+}
+
+fn truncate_for_title_prompt(text: &str) -> String {
+    truncate_chars(text, SESSION_TITLE_PROMPT_MAX_CHARS)
+}
+
+fn prompt_text_from_items(items: &[UserInput]) -> Option<String> {
+    let text = items
+        .iter()
+        .filter_map(|item| match item {
+            UserInput::Text { text, .. } => Some(text.trim()),
+            _ => None,
+        })
+        .filter(|text| !text.is_empty())
+        .join("\n");
+    (!text.is_empty()).then_some(text)
+}
+
+fn normalize_session_title(title: &str, prompt_text: Option<&str>) -> Option<String> {
+    let title = title
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`' | '*'))
+        .trim_end_matches(|ch: char| matches!(ch, '.' | '。'))
+        .trim();
+    if title.is_empty() {
+        return None;
+    }
+    if prompt_text.is_some_and(|prompt| equivalent_title_text(title, prompt)) {
+        return None;
+    }
+    Some(truncate_chars(title, SESSION_TITLE_MAX_CHARS))
+}
+
+fn equivalent_title_text(left: &str, right: &str) -> bool {
+    canonical_title_text(left) == canonical_title_text(right)
+}
+
+fn canonical_title_text(text: &str) -> String {
+    text.split_whitespace().join(" ")
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars.saturating_sub(3);
+    let truncated = text.chars().take(keep).collect::<String>();
+    format!("{truncated}...")
 }
 
 fn build_prompt_items(prompt: Vec<ContentBlock>) -> Vec<UserInput> {
@@ -4221,7 +4692,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use agent_client_protocol::schema::{RequestPermissionResponse, TextContent};
@@ -4379,14 +4850,15 @@ mod tests {
         drop(message_tx);
 
         let notifications = client.notifications.lock().unwrap();
-        assert_eq!(notifications.len(), 1);
-        assert!(matches!(
-            &notifications[0].update,
-            SessionUpdate::AgentMessageChunk(ContentChunk {
-                content: ContentBlock::Text(TextContent { text, .. }),
-                ..
-            }) if text == "Compact task completed"
-        ));
+        assert!(notifications.iter().any(|notification| {
+            matches!(
+                &notification.update,
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) if text == "Compact task completed"
+            )
+        }));
         let ops = thread.ops.lock().unwrap();
         assert_eq!(ops.as_slice(), &[Op::Compact]);
 
@@ -4502,14 +4974,15 @@ mod tests {
         drop(message_tx);
 
         let notifications = client.notifications.lock().unwrap();
-        assert_eq!(notifications.len(), 1);
         assert!(
-            matches!(
-                &notifications[0].update,
-                SessionUpdate::AgentMessageChunk(ContentChunk {
-                    content: ContentBlock::Text(TextContent { text, .. }), ..
-                }) if text == INIT_COMMAND_PROMPT // we echo the prompt
-            ),
+            notifications.iter().any(|notification| {
+                matches!(
+                    &notification.update,
+                    SessionUpdate::AgentMessageChunk(ContentChunk {
+                        content: ContentBlock::Text(TextContent { text, .. }), ..
+                    }) if text == INIT_COMMAND_PROMPT // we echo the prompt
+                )
+            }),
             "notifications don't match {notifications:?}"
         );
         let ops = thread.ops.lock().unwrap();
@@ -4755,7 +5228,19 @@ mod tests {
         UnboundedSender<ThreadMessage>,
         tokio::task::JoinHandle<()>,
     )> {
-        let session_id = SessionId::new("test");
+        setup_with_title_generator(None).await
+    }
+
+    async fn setup_with_title_generator(
+        title_generator: Option<Arc<dyn SessionTitleGenerator>>,
+    ) -> anyhow::Result<(
+        SessionId,
+        Arc<StubClient>,
+        Arc<StubCodexThread>,
+        UnboundedSender<ThreadMessage>,
+        tokio::task::JoinHandle<()>,
+    )> {
+        let session_id = SessionId::new(ThreadId::default().to_string());
         let client = Arc::new(StubClient::new());
         let session_client =
             SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
@@ -4775,6 +5260,7 @@ mod tests {
             conversation.clone(),
             models_manager,
             config,
+            title_generator,
             message_rx,
             resolution_tx,
             resolution_rx,
@@ -4802,14 +5288,51 @@ mod tests {
             Box::pin(async { all_model_presets()[0].to_owned().id })
         }
 
+        fn get_model_info(
+            &self,
+            model: &str,
+            _config: &Config,
+        ) -> Pin<Box<dyn Future<Output = CodexModelInfo> + Send + '_>> {
+            let model = model.to_string();
+            Box::pin(async move { codex_models_manager::model_info::model_info_from_slug(&model) })
+        }
+
         fn list_models(&self) -> Pin<Box<dyn Future<Output = Vec<ModelPreset>> + Send + '_>> {
             Box::pin(async { all_model_presets().to_owned() })
+        }
+    }
+
+    struct StubSessionTitleGenerator {
+        title: Option<String>,
+        calls: AtomicUsize,
+    }
+
+    impl StubSessionTitleGenerator {
+        fn new(title: Option<&str>) -> Self {
+            Self {
+                title: title.map(ToOwned::to_owned),
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl SessionTitleGenerator for StubSessionTitleGenerator {
+        fn generate_title(
+            &self,
+            _session_id: &SessionId,
+            _prompt_text: &str,
+            _response_text: Option<&str>,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<String>>> + Send + '_>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(self.title.clone()) })
         }
     }
 
     struct StubCodexThread {
         current_id: AtomicUsize,
         active_prompt_id: std::sync::Mutex<Option<String>>,
+        thread_name: std::sync::Mutex<Option<String>>,
+        first_user_message: std::sync::Mutex<Option<String>>,
         ops: std::sync::Mutex<Vec<Op>>,
         op_tx: mpsc::UnboundedSender<Event>,
         op_rx: Mutex<mpsc::UnboundedReceiver<Event>>,
@@ -4821,6 +5344,8 @@ mod tests {
             StubCodexThread {
                 current_id: AtomicUsize::new(0),
                 active_prompt_id: std::sync::Mutex::default(),
+                thread_name: std::sync::Mutex::default(),
+                first_user_message: std::sync::Mutex::default(),
                 ops: std::sync::Mutex::default(),
                 op_tx,
                 op_rx: Mutex::new(op_rx),
@@ -4850,6 +5375,11 @@ mod tests {
                                 _ => unimplemented!(),
                             })
                             .join("\n");
+                        let mut first_user_message = self.first_user_message.lock().unwrap();
+                        if first_user_message.is_none() {
+                            *first_user_message = Some(prompt.clone());
+                        }
+                        drop(first_user_message);
 
                         if prompt == "parallel-exec" {
                             // Emit interleaved exec events: Begin A, Begin B, End A, End B
@@ -4932,6 +5462,23 @@ mod tests {
                                 duration_ms: None,
                                 time_to_first_token_ms: None,
                             }));
+                        } else if prompt == "title-sync" {
+                            let turn_id = id.to_string();
+                            let send = |msg| {
+                                self.op_tx
+                                    .send(Event {
+                                        id: id.to_string(),
+                                        msg,
+                                    })
+                                    .unwrap();
+                            };
+                            send(EventMsg::TurnComplete(TurnCompleteEvent {
+                                last_agent_message: Some("Session title sync is fixed.".into()),
+                                turn_id,
+                                completed_at: None,
+                                duration_ms: None,
+                                time_to_first_token_ms: None,
+                            }));
                         } else if prompt == "image-generation" {
                             let turn_id = id.to_string();
                             let saved_path = image_generation_test_saved_path();
@@ -5002,6 +5549,7 @@ mod tests {
                                         call_id: "call-id".to_string(),
                                         approval_id: Some("approval-id".to_string()),
                                         turn_id: id.to_string(),
+                                        started_at_ms: 0,
                                         command: vec!["echo".to_string(), "hi".to_string()],
                                         cwd: std::env::current_dir().unwrap().try_into().unwrap(),
                                         reason: None,
@@ -5167,6 +5715,27 @@ mod tests {
                 Ok(event)
             })
         }
+
+        fn read_thread_title_state(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<ThreadTitleState>> + Send + '_>> {
+            Box::pin(async {
+                Ok(ThreadTitleState {
+                    name: self.thread_name.lock().unwrap().clone(),
+                    first_user_message: self.first_user_message.lock().unwrap().clone(),
+                })
+            })
+        }
+
+        fn set_thread_name(
+            &self,
+            name: String,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
+            Box::pin(async move {
+                *self.thread_name.lock().unwrap() = Some(name);
+                Ok(())
+            })
+        }
     }
 
     struct StubClient {
@@ -5308,6 +5877,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn first_turn_persists_and_publishes_llm_session_title() -> anyhow::Result<()> {
+        let title_generator = Arc::new(StubSessionTitleGenerator::new(Some("LLM Session Title")));
+        let title_generator_trait: Arc<dyn SessionTitleGenerator> = title_generator.clone();
+        let (session_id, client, thread, message_tx, _handle) =
+            setup_with_title_generator(Some(title_generator_trait)).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["title-sync".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        assert_eq!(
+            thread.thread_name.lock().unwrap().as_deref(),
+            Some("LLM Session Title")
+        );
+        assert_eq!(title_generator.calls.load(Ordering::SeqCst), 1);
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(
+            notifications.iter().any(|notification| {
+                matches!(
+                    &notification.update,
+                    SessionUpdate::SessionInfoUpdate(update)
+                        if update.title.value().map(String::as_str)
+                            == Some("LLM Session Title")
+                )
+            }),
+            "missing session info title update: {notifications:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn first_turn_does_not_use_agent_reply_as_session_title() -> anyhow::Result<()> {
+        let (session_id, client, thread, message_tx, _handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["title-sync".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        assert_eq!(thread.thread_name.lock().unwrap().as_deref(), None);
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(
+            !notifications.iter().any(|notification| matches!(
+                &notification.update,
+                SessionUpdate::SessionInfoUpdate(update)
+                    if update.title.value().is_some()
+            )),
+            "agent reply should not be reused as a title: {notifications:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_exec_approval_uses_available_decisions() -> anyhow::Result<()> {
         let session_id = SessionId::new("test");
         let client = Arc::new(StubClient::with_permission_responses(vec![
@@ -5315,13 +5952,18 @@ mod tests {
                 SelectedPermissionOutcome::new("denied"),
             )),
         ]));
-        let session_client = SessionClient::with_client(session_id, client.clone(), Arc::default());
+        let session_client =
+            SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
         let thread = Arc::new(StubCodexThread::new());
         let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
         let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut prompt_state = PromptState::new(
             "submission-id".to_string(),
+            session_id.clone(),
             thread.clone(),
+            Arc::new(std::sync::Mutex::new(None)),
+            None,
+            None,
             message_tx,
             response_tx,
         );
@@ -5332,6 +5974,7 @@ mod tests {
                 call_id: "call-id".to_string(),
                 approval_id: Some("approval-id".to_string()),
                 turn_id: "turn-id".to_string(),
+                started_at_ms: 0,
                 command: vec!["echo".to_string(), "hi".to_string()],
                 cwd: std::env::current_dir()?.try_into()?,
                 reason: None,
@@ -5390,13 +6033,18 @@ mod tests {
                 SelectedPermissionOutcome::new(MCP_TOOL_APPROVAL_ALLOW_SESSION_OPTION_ID),
             )),
         ]));
-        let session_client = SessionClient::with_client(session_id, client.clone(), Arc::default());
+        let session_client =
+            SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
         let thread = Arc::new(StubCodexThread::new());
         let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
         let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut prompt_state = PromptState::new(
             "submission-id".to_string(),
+            session_id.clone(),
             thread.clone(),
+            Arc::new(std::sync::Mutex::new(None)),
+            None,
+            None,
             message_tx,
             response_tx,
         );
@@ -5501,13 +6149,18 @@ mod tests {
                 SelectedPermissionOutcome::new("decline"),
             )),
         ]));
-        let session_client = SessionClient::with_client(session_id, client.clone(), Arc::default());
+        let session_client =
+            SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
         let thread = Arc::new(StubCodexThread::new());
         let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
         let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut prompt_state = PromptState::new(
             "submission-id".to_string(),
+            session_id.clone(),
             thread.clone(),
+            Arc::new(std::sync::Mutex::new(None)),
+            None,
+            None,
             message_tx,
             response_tx,
         );
@@ -5561,12 +6214,21 @@ mod tests {
             vec![],
             Arc::new(Notify::new()),
         ));
-        let session_client = SessionClient::with_client(session_id, client.clone(), Arc::default());
+        let session_client =
+            SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
         let thread = Arc::new(StubCodexThread::new());
         let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
         let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut prompt_state =
-            PromptState::new("submission-id".to_string(), thread, message_tx, response_tx);
+        let mut prompt_state = PromptState::new(
+            "submission-id".to_string(),
+            session_id.clone(),
+            thread,
+            Arc::new(std::sync::Mutex::new(None)),
+            None,
+            None,
+            message_tx,
+            response_tx,
+        );
 
         prompt_state
             .handle_event(
@@ -5575,6 +6237,7 @@ mod tests {
                     call_id: "call-id".to_string(),
                     approval_id: Some("approval-id".to_string()),
                     turn_id: "turn-id".to_string(),
+                    started_at_ms: 0,
                     command: vec!["echo".to_string(), "hi".to_string()],
                     cwd: std::env::current_dir()?.try_into()?,
                     reason: None,
@@ -5647,6 +6310,7 @@ mod tests {
             conversation.clone(),
             models_manager,
             config,
+            None,
             message_rx,
             resolution_tx,
             resolution_rx,

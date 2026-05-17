@@ -15,8 +15,8 @@ use agent_client_protocol as acp;
 use codex_config::{McpServerConfig, McpServerTransportConfig};
 use codex_core::{
     NewThread, RolloutRecorder, SortDirection, StateDbHandle, ThreadManager, ThreadSortKey,
-    config::Config, find_thread_path_by_id_str, init_state_db, parse_cursor,
-    resolve_installation_id, thread_store_from_config,
+    config::Config, find_thread_names_by_ids, find_thread_path_by_id_str, init_state_db,
+    parse_cursor, resolve_installation_id, thread_store_from_config,
 };
 use codex_exec_server::{EnvironmentManager, EnvironmentManagerArgs, ExecServerRuntimePaths};
 use codex_login::{
@@ -28,12 +28,11 @@ use codex_protocol::{
     protocol::{InitialHistory, SessionSource},
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 use tracing::{debug, info};
-use unicode_segmentation::UnicodeSegmentation;
 
 use crate::thread::Thread;
 
@@ -59,7 +58,6 @@ pub struct CodexAgent {
 }
 
 const SESSION_LIST_PAGE_SIZE: usize = 25;
-const SESSION_TITLE_MAX_GRAPHEMES: usize = 120;
 
 impl CodexAgent {
     /// Create a new `CodexAgent` with the given configuration
@@ -435,15 +433,7 @@ impl CodexAgent {
 
         *self.client_capabilities.lock().unwrap() = client_capabilities;
 
-        let mut agent_capabilities = AgentCapabilities::new()
-            .prompt_capabilities(PromptCapabilities::new().embedded_context(true).image(true))
-            .mcp_capabilities(McpCapabilities::new().http(true))
-            .load_session(true)
-            .auth(AgentAuthCapabilities::new().logout(LogoutCapabilities::new()));
-
-        agent_capabilities.session_capabilities = SessionCapabilities::new()
-            .close(SessionCloseCapabilities::new())
-            .list(SessionListCapabilities::new());
+        let agent_capabilities = build_agent_capabilities();
 
         let mut auth_methods = vec![
             CodexAuthMethod::ChatGpt.into(),
@@ -695,7 +685,7 @@ impl CodexAgent {
         .await
         .map_err(|err| Error::internal_error().data(format!("failed to list sessions: {err}")))?;
 
-        let sessions = page
+        let session_items = page
             .items
             .into_iter()
             .filter_map(|item| {
@@ -708,17 +698,27 @@ impl CodexAgent {
                     return None;
                 }
 
-                let title = item
-                    .first_user_message
-                    .as_deref()
-                    .and_then(format_session_title);
                 let updated_at = item.updated_at.or(item.created_at);
+                Some((thread_id, item_cwd, updated_at, item.first_user_message))
+            })
+            .collect::<Vec<_>>();
 
-                Some(
-                    SessionInfo::new(SessionId::new(thread_id.to_string()), item_cwd)
-                        .title(title)
-                        .updated_at(updated_at),
-                )
+        let thread_ids = session_items
+            .iter()
+            .map(|(thread_id, _, _, _)| *thread_id)
+            .collect::<HashSet<_>>();
+        let titles = self.session_titles(&thread_ids).await;
+
+        let sessions = session_items
+            .into_iter()
+            .map(|(thread_id, item_cwd, updated_at, first_user_message)| {
+                let title = titles
+                    .get(&thread_id)
+                    .and_then(|title| distinct_session_title(title, first_user_message.as_deref()));
+
+                SessionInfo::new(SessionId::new(thread_id.to_string()), item_cwd)
+                    .title(title)
+                    .updated_at(updated_at)
             })
             .collect::<Vec<_>>();
 
@@ -729,6 +729,34 @@ impl CodexAgent {
             .and_then(|value| value.as_str().map(str::to_owned));
 
         Ok(ListSessionsResponse::new(sessions).next_cursor(next_cursor))
+    }
+
+    async fn session_titles(&self, thread_ids: &HashSet<ThreadId>) -> HashMap<ThreadId, String> {
+        let mut titles = HashMap::with_capacity(thread_ids.len());
+
+        if let Some(state_db) = self.state_db.as_deref() {
+            for &thread_id in thread_ids {
+                let Ok(Some(metadata)) = state_db.get_thread(thread_id).await else {
+                    continue;
+                };
+                if let Some(title) =
+                    distinct_session_title(&metadata.title, metadata.first_user_message.as_deref())
+                {
+                    titles.insert(thread_id, title);
+                }
+            }
+        }
+
+        if titles.len() < thread_ids.len()
+            && let Ok(legacy_titles) =
+                find_thread_names_by_ids(&self.config.codex_home, thread_ids).await
+        {
+            for (thread_id, title) in legacy_titles {
+                titles.entry(thread_id).or_insert(title);
+            }
+        }
+
+        titles
     }
 
     async fn close_session(
@@ -811,6 +839,19 @@ impl CodexAgent {
     }
 }
 
+fn build_agent_capabilities() -> AgentCapabilities {
+    AgentCapabilities::new()
+        .prompt_capabilities(PromptCapabilities::new().embedded_context(true).image(true))
+        .mcp_capabilities(McpCapabilities::new().http(true))
+        .load_session(true)
+        .session_capabilities(
+            SessionCapabilities::new()
+                .close(SessionCloseCapabilities::new())
+                .list(SessionListCapabilities::new()),
+        )
+        .auth(AgentAuthCapabilities::new().logout(LogoutCapabilities::new()))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CodexAuthMethod {
     ChatGpt,
@@ -873,33 +914,49 @@ impl TryFrom<AuthMethodId> for CodexAuthMethod {
     }
 }
 
-fn truncate_graphemes(text: &str, max_graphemes: usize) -> String {
-    let mut graphemes = text.grapheme_indices(true);
-
-    if let Some((byte_index, _)) = graphemes.nth(max_graphemes) {
-        if max_graphemes >= 3 {
-            let mut truncate_graphemes = text.grapheme_indices(true);
-            if let Some((truncate_byte_index, _)) = truncate_graphemes.nth(max_graphemes - 3) {
-                let truncated = &text[..truncate_byte_index];
-                format!("{truncated}...")
-            } else {
-                text.to_string()
-            }
-        } else {
-            let truncated = &text[..byte_index];
-            truncated.to_string()
-        }
+fn distinct_session_title(title: &str, first_user_message: Option<&str>) -> Option<String> {
+    let title = title.trim();
+    if title.is_empty() || first_user_message.map(str::trim) == Some(title) {
+        None
     } else {
-        text.to_string()
+        Some(title.to_string())
     }
 }
 
-fn format_session_title(message: &str) -> Option<String> {
-    let normalized = message.replace(['\r', '\n'], " ");
-    let trimmed = normalized.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(truncate_graphemes(trimmed, SESSION_TITLE_MAX_GRAPHEMES))
+#[cfg(test)]
+mod tests {
+    use super::InitializeResponse;
+    use super::{ProtocolVersion, build_agent_capabilities, distinct_session_title};
+
+    #[test]
+    fn distinct_session_title_ignores_first_user_message() {
+        assert_eq!(
+            distinct_session_title("  Fix the parser  ", Some("Fix the parser")),
+            None
+        );
+    }
+
+    #[test]
+    fn distinct_session_title_keeps_saved_title() {
+        assert_eq!(
+            distinct_session_title("Parser cleanup", Some("Fix the parser")),
+            Some("Parser cleanup".to_string())
+        );
+    }
+
+    #[test]
+    fn initialize_response_advertises_session_list_capability() {
+        let response = InitializeResponse::new(ProtocolVersion::V1)
+            .agent_capabilities(build_agent_capabilities());
+        let value = serde_json::to_value(response).expect("serialize initialize response");
+
+        assert_eq!(
+            value.pointer("/agentCapabilities/sessionCapabilities/list"),
+            Some(&serde_json::json!({}))
+        );
+        assert_eq!(
+            value.pointer("/agentCapabilities/sessionCapabilities/close"),
+            Some(&serde_json::json!({}))
+        );
     }
 }
