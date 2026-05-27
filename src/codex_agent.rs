@@ -19,7 +19,6 @@ use codex_core::{
     parse_cursor, resolve_installation_id, thread_store_from_config,
 };
 use codex_exec_server::{EnvironmentManager, ExecServerRuntimePaths};
-use codex_extension_api::empty_extension_registry;
 use codex_login::{
     CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR,
     auth::{AuthManager, CodexAuth, read_codex_api_key_from_env, read_openai_api_key_from_env},
@@ -80,7 +79,7 @@ impl CodexAgent {
         let local_runtime_paths =
             ExecServerRuntimePaths::new(std::env::current_exe()?, codex_linux_sandbox_exe)?;
         let environment_manager = Arc::new(
-            EnvironmentManager::from_codex_home(&config.codex_home, Some(local_runtime_paths))
+            EnvironmentManager::from_codex_home(&config.codex_home, local_runtime_paths)
                 .await
                 .map_err(std::io::Error::other)?,
         );
@@ -91,12 +90,10 @@ impl CodexAgent {
             auth_manager.clone(),
             SessionSource::Unknown,
             environment_manager,
-            empty_extension_registry(),
             None,
             thread_store,
             state_db.clone(),
             installation_id,
-            None,
         );
         Ok(Self {
             auth_manager,
@@ -362,7 +359,6 @@ impl CodexAgent {
                             enabled_tools: None,
                             disabled_reason: None,
                             scopes: None,
-                            oauth: None,
                             oauth_resource: None,
                             tools: Default::default(),
                             experimental_environment: None,
@@ -402,7 +398,6 @@ impl CodexAgent {
                             enabled_tools: None,
                             disabled_reason: None,
                             scopes: None,
-                            oauth: None,
                             oauth_resource: None,
                             tools: Default::default(),
                             experimental_environment: None,

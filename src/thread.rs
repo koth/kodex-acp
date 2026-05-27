@@ -46,8 +46,7 @@ use codex_protocol::{
     error::CodexErr,
     mcp::CallToolResult,
     models::{
-        ActivePermissionProfile, AdditionalPermissionProfile, ContentItem, PermissionProfile,
-        ResponseItem, WebSearchAction,
+        AdditionalPermissionProfile, ContentItem, PermissionProfile, ResponseItem, WebSearchAction,
     },
     openai_models::{ModelInfo as CodexModelInfo, ModelPreset, ReasoningEffort},
     parse_command::ParsedCommand,
@@ -71,7 +70,6 @@ use codex_protocol::{
         StreamErrorEvent, TerminalInteractionEvent, ThreadGoalStatus, ThreadGoalUpdatedEvent,
         TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
         ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
-        ThreadSettingsOverrides
     },
     request_permissions::{
         PermissionGrantScope, RequestPermissionProfile, RequestPermissionsEvent,
@@ -144,15 +142,6 @@ fn session_mode_id_for_active_profile(profile_id: &str) -> Option<&'static str> 
     }
 }
 
-fn active_profile_id_for_session_mode(mode_id: &str) -> Option<&'static str> {
-    match mode_id {
-        "read-only" => Some(CODEX_READ_ONLY_PROFILE_ID),
-        "auto" => Some(CODEX_WORKSPACE_PROFILE_ID),
-        "full-access" => Some(CODEX_DANGER_NO_SANDBOX_PROFILE_ID),
-        _ => None,
-    }
-}
-
 fn approval_matches_current_config(preset: &ApprovalPreset, config: &Config) -> bool {
     std::mem::discriminant(&preset.approval)
         == std::mem::discriminant(config.permissions.approval_policy.get())
@@ -213,7 +202,7 @@ fn current_session_mode_id(config: &Config) -> Option<SessionModeId> {
 
     if let Some(preset) = APPROVAL_PRESETS.iter().find(|preset| {
         approval_matches_current_config(preset, config)
-            && &preset.permission_profile == config.permissions.permission_profile()
+            && preset.permission_profile == config.permissions.permission_profile()
     }) {
         return Some(SessionModeId::new(preset.id));
     }
@@ -282,7 +271,7 @@ impl CodexThreadImpl for CodexThread {
         Box::pin(async move {
             self.update_thread_metadata(
                 ThreadMetadataPatch {
-                    name: Some(Some(name)),
+                    name: Some(name),
                     ..Default::default()
                 },
                 /*include_archived*/ false,
@@ -397,7 +386,6 @@ impl SessionTitleGenerator for ModelSessionTitleGenerator {
                 /*enable_request_compression*/ false,
                 /*include_timing_metrics*/ false,
                 /*beta_features_header*/ None,
-                /*attestation_provider*/ None,
             );
 
             let telemetry = SessionTelemetry::new(
@@ -994,8 +982,6 @@ fn format_thread_goal_update(event: &ThreadGoalUpdatedEvent) -> String {
         ThreadGoalStatus::Active => "active",
         ThreadGoalStatus::Paused => "paused",
         ThreadGoalStatus::BudgetLimited => "budget limited",
-        ThreadGoalStatus::Blocked => "blocked",
-        ThreadGoalStatus::UsageLimited => "usage limited",
         ThreadGoalStatus::Complete => "complete",
     };
 
@@ -1832,9 +1818,9 @@ impl PromptState {
             | EventMsg::ThreadRolledBack(..)
             | EventMsg::HookStarted(..)
             | EventMsg::HookCompleted(..)
+            | EventMsg::SkillsUpdateAvailable
             // we already have a way to diff the turn, so ignore
             | EventMsg::TurnDiff(..)
-            | EventMsg::ThreadSettingsApplied(..)
             // Old events
             | EventMsg::RawResponseItem(..)
             | EventMsg::SessionConfigured(..)
@@ -2669,7 +2655,7 @@ impl PromptState {
                 file_system
                     .entries
                     .iter()
-                    .filter(|entry| entry.access == FileSystemAccessMode::Deny),
+                    .filter(|entry| entry.access == FileSystemAccessMode::None),
             );
             if !denies.is_empty() {
                 content.push(format!("File System Denied Access: {denies}"));
@@ -3524,12 +3510,19 @@ impl<A: Auth> ThreadActor<A> {
         };
 
         self.thread
-            .submit(Op::ThreadSettings {
-                thread_settings: ThreadSettingsOverrides {
-                    model: Some(model_to_use.clone()),
-                    effort: Some(effort_to_use),
-                    ..Default::default()
-                },
+            .submit(Op::OverrideTurnContext {
+                cwd: None,
+                approval_policy: None,
+                approvals_reviewer: None,
+                sandbox_policy: None,
+                permission_profile: None,
+                windows_sandbox_level: None,
+                model: Some(model_to_use.clone()),
+                effort: Some(effort_to_use),
+                summary: None,
+                service_tier: None,
+                collaboration_mode: None,
+                personality: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -3565,11 +3558,19 @@ impl<A: Auth> ThreadActor<A> {
         }
 
         self.thread
-            .submit(Op::ThreadSettings {
-                thread_settings: ThreadSettingsOverrides {
-                    effort: Some(Some(effort)),
-                    ..Default::default()
-                },
+            .submit(Op::OverrideTurnContext {
+                cwd: None,
+                approval_policy: None,
+                approvals_reviewer: None,
+                sandbox_policy: None,
+                permission_profile: None,
+                windows_sandbox_level: None,
+                model: None,
+                effort: Some(Some(effort)),
+                summary: None,
+                service_tier: None,
+                collaboration_mode: None,
+                personality: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -3641,7 +3642,6 @@ impl<A: Auth> ThreadActor<A> {
                         final_output_json_schema: None,
                         environments: None,
                         responsesapi_client_metadata: None,
-                        thread_settings: Default::default(),
                     }
                 }
                 "review" => {
@@ -3694,7 +3694,6 @@ impl<A: Auth> ThreadActor<A> {
                         final_output_json_schema: None,
                         environments: None,
                         responsesapi_client_metadata: None,
-                        thread_settings: Default::default(),
                     }
                 }
             }
@@ -3704,7 +3703,6 @@ impl<A: Auth> ThreadActor<A> {
                 final_output_json_schema: None,
                 environments: None,
                 responsesapi_client_metadata: None,
-                thread_settings: Default::default(),
             }
         }
 
@@ -3740,14 +3738,19 @@ impl<A: Auth> ThreadActor<A> {
             .ok_or_else(Error::invalid_params)?;
 
         self.thread
-            .submit(Op::ThreadSettings {
-                thread_settings: ThreadSettingsOverrides {
-                    approval_policy: Some(preset.approval),
-                    permission_profile: Some(preset.permission_profile.clone()),
-                    active_permission_profile: active_profile_id_for_session_mode(preset.id)
-                        .map(ActivePermissionProfile::new),
-                    ..Default::default()
-                },
+            .submit(Op::OverrideTurnContext {
+                cwd: None,
+                approval_policy: Some(preset.approval),
+                approvals_reviewer: None,
+                sandbox_policy: None,
+                permission_profile: Some(preset.permission_profile.clone()),
+                windows_sandbox_level: None,
+                model: None,
+                effort: None,
+                summary: None,
+                service_tier: None,
+                collaboration_mode: None,
+                personality: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -3796,12 +3799,19 @@ impl<A: Auth> ThreadActor<A> {
         }
 
         self.thread
-            .submit(Op::ThreadSettings {
-                thread_settings: ThreadSettingsOverrides {
-                    model: Some(model_to_use.clone()),
-                    effort: Some(effort_to_use),
-                    ..Default::default()
-                },
+            .submit(Op::OverrideTurnContext {
+                cwd: None,
+                approval_policy: None,
+                approvals_reviewer: None,
+                sandbox_policy: None,
+                permission_profile: None,
+                windows_sandbox_level: None,
+                model: Some(model_to_use.clone()),
+                effort: Some(effort_to_use),
+                summary: None,
+                service_tier: None,
+                collaboration_mode: None,
+                personality: None,
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -4286,7 +4296,6 @@ fn build_prompt_items(prompt: Vec<ContentBlock>) -> Vec<UserInput> {
             }),
             ContentBlock::Image(image_block) => Some(UserInput::Image {
                 image_url: format!("data:{};base64,{}", image_block.mime_type, image_block.data),
-                detail: None,
             }),
             ContentBlock::ResourceLink(ResourceLink { name, uri, .. }) => Some(UserInput::Text {
                 text: format_uri_as_link(Some(name), uri),
@@ -4990,7 +4999,6 @@ mod tests {
                 final_output_json_schema: None,
                 environments: None,
                 responsesapi_client_metadata: None,
-                thread_settings: Default::default(),
             }],
             "ops don't match {ops:?}"
         );
