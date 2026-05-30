@@ -44,9 +44,11 @@ use codex_protocol::{
     config_types::{ReasoningSummary, TrustLevel},
     dynamic_tools::{DynamicToolCallOutputContentItem, DynamicToolCallRequest},
     error::CodexErr,
+    items::TurnItem,
     mcp::CallToolResult,
     models::{
-        AdditionalPermissionProfile, ContentItem, PermissionProfile, ResponseItem, WebSearchAction,
+        AdditionalPermissionProfile, ContentItem, MessagePhase, PermissionProfile, ResponseItem,
+        WebSearchAction,
     },
     openai_models::{ModelInfo as CodexModelInfo, ModelPreset, ReasoningEffort},
     parse_command::ParsedCommand,
@@ -122,7 +124,9 @@ const CODEX_WORKSPACE_PROFILE_ID: &str = ":workspace";
 const CODEX_DANGER_NO_SANDBOX_PROFILE_ID: &str = ":danger-no-sandbox";
 const SESSION_TITLE_MAX_CHARS: usize = 60;
 const SESSION_TITLE_GENERATION_TIMEOUT: Duration = Duration::from_secs(20);
+const SESSION_TITLE_ROLLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const SESSION_TITLE_PROMPT_MAX_CHARS: usize = 4_000;
+const KODEX_CONTEXT_COMPACTED_META_KEY: &str = "kodex.ai/contextCompacted";
 const SESSION_TITLE_INSTRUCTIONS: &str = r#"Generate a concise title for this coding session.
 
 Rules:
@@ -446,6 +450,20 @@ impl SessionTitleGenerator for ModelSessionTitleGenerator {
             Ok(normalize_session_title(&title, Some(&prompt_text)))
         })
     }
+}
+
+pub async fn generate_session_title_with_model(
+    auth: Arc<AuthManager>,
+    models_manager: Arc<dyn ModelsManagerImpl>,
+    config: Config,
+    session_id: &SessionId,
+    prompt_text: &str,
+    response_text: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let generator = ModelSessionTitleGenerator::new(auth, models_manager, config);
+    generator
+        .generate_title(session_id, prompt_text, response_text)
+        .await
 }
 
 pub trait Auth {
@@ -1075,6 +1093,7 @@ struct PromptState {
     seen_message_deltas: bool,
     seen_reasoning_deltas: bool,
     agent_message_text: String,
+    commentary_message_item_ids: HashSet<String>,
 }
 
 impl PromptState {
@@ -1107,6 +1126,7 @@ impl PromptState {
             seen_message_deltas: false,
             seen_reasoning_deltas: false,
             agent_message_text: String::new(),
+            commentary_message_item_ids: HashSet::new(),
         }
     }
 
@@ -1167,11 +1187,31 @@ impl PromptState {
             Ok(Ok(None)) => return,
             Ok(Err(err)) => {
                 warn!("Failed to generate session title: {err}");
-                return;
+                match self
+                    .generate_session_title_via_hidden_turn(prompt_text, response_text)
+                    .await
+                {
+                    Ok(Some(title)) => title,
+                    Ok(None) => return,
+                    Err(err) => {
+                        warn!("Failed to generate session title via hidden turn: {err}");
+                        return;
+                    }
+                }
             }
             Err(_) => {
                 warn!("Timed out generating session title");
-                return;
+                match self
+                    .generate_session_title_via_hidden_turn(prompt_text, response_text)
+                    .await
+                {
+                    Ok(Some(title)) => title,
+                    Ok(None) => return,
+                    Err(err) => {
+                        warn!("Failed to generate session title via hidden turn: {err}");
+                        return;
+                    }
+                }
             }
         };
 
@@ -1180,6 +1220,172 @@ impl PromptState {
         }
 
         publish_session_title(&self.session_title, client, title);
+    }
+
+    async fn generate_session_title_via_hidden_turn(
+        &self,
+        prompt_text: &str,
+        response_text: Option<&str>,
+    ) -> anyhow::Result<Option<String>> {
+        let title_prompt = build_session_title_prompt(prompt_text, response_text);
+        let submission_id = self
+            .thread
+            .submit(Op::UserInput {
+                items: vec![UserInput::Text {
+                    text: title_prompt,
+                    text_elements: vec![],
+                }],
+                final_output_json_schema: None,
+                environments: None,
+                responsesapi_client_metadata: None,
+            })
+            .await?;
+
+        let title = match tokio::time::timeout(
+            SESSION_TITLE_GENERATION_TIMEOUT,
+            self.collect_hidden_title_turn(&submission_id, prompt_text),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                warn!("Timed out generating session title via hidden turn");
+                if let Err(err) = self.thread.submit(Op::Interrupt).await {
+                    warn!("Failed to interrupt timed out hidden session title turn: {err}");
+                }
+                return Ok(None);
+            }
+        };
+
+        if !self.rollback_hidden_title_turn().await {
+            warn!(
+                "Hidden session title turn was not rolled back; publishing title anyway because rollback failure already leaves the thread state unchanged"
+            );
+        }
+
+        Ok(title)
+    }
+
+    async fn collect_hidden_title_turn(
+        &self,
+        submission_id: &str,
+        prompt_text: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let mut title = String::new();
+
+        loop {
+            let Event { id, msg } = self.thread.next_event().await?;
+            if id != submission_id {
+                warn!(
+                    "Ignoring event for unrelated submission while collecting hidden session title: {id}"
+                );
+                continue;
+            }
+
+            match msg {
+                EventMsg::AgentMessageContentDelta(AgentMessageContentDeltaEvent {
+                    delta, ..
+                }) => title.push_str(&delta),
+                EventMsg::AgentMessage(AgentMessageEvent { message, .. }) => {
+                    if title.trim().is_empty() {
+                        title.push_str(&message);
+                    }
+                }
+                EventMsg::TurnComplete(TurnCompleteEvent {
+                    last_agent_message, ..
+                }) => {
+                    if title.trim().is_empty()
+                        && let Some(last_agent_message) = last_agent_message
+                    {
+                        title.push_str(&last_agent_message);
+                    }
+                    break;
+                }
+                EventMsg::TurnAborted(event) => {
+                    warn!(
+                        "Hidden session title turn aborted: turn_id={:?}, reason={:?}",
+                        event.turn_id, event.reason
+                    );
+                    return Ok(None);
+                }
+                EventMsg::Error(ErrorEvent { message, .. }) => {
+                    return Err(anyhow::anyhow!("hidden title turn failed: {message}"));
+                }
+                EventMsg::StreamError(StreamErrorEvent { message, .. }) => {
+                    return Err(anyhow::anyhow!(
+                        "hidden title turn stream failed: {message}"
+                    ));
+                }
+                EventMsg::ExecApprovalRequest(..)
+                | EventMsg::RequestPermissions(..)
+                | EventMsg::DynamicToolCallRequest(..)
+                | EventMsg::McpToolCallBegin(..)
+                | EventMsg::ApplyPatchApprovalRequest(..)
+                | EventMsg::PatchApplyBegin(..) => {
+                    warn!(
+                        "Hidden session title turn requested tool or permission; aborting title generation"
+                    );
+                    if let Err(err) = self.thread.submit(Op::Interrupt).await {
+                        warn!("Failed to interrupt hidden session title turn: {err}");
+                    }
+                    return Ok(None);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(normalize_session_title(&title, Some(prompt_text)))
+    }
+
+    async fn rollback_hidden_title_turn(&self) -> bool {
+        let rollback_id = match self
+            .thread
+            .submit(Op::ThreadRollback { num_turns: 1 })
+            .await
+        {
+            Ok(id) => id,
+            Err(err) => {
+                warn!("Failed to submit hidden session title rollback: {err}");
+                return false;
+            }
+        };
+
+        let rollback = async {
+            loop {
+                let Event { id, msg } = self.thread.next_event().await?;
+                if id != rollback_id {
+                    warn!(
+                        "Ignoring event for unrelated submission while rolling back hidden session title turn: {id}"
+                    );
+                    continue;
+                }
+
+                match msg {
+                    EventMsg::ThreadRolledBack(..) => return Ok::<bool, CodexErr>(true),
+                    EventMsg::Error(ErrorEvent { message, .. }) => {
+                        warn!("Hidden session title rollback failed: {message}");
+                        return Ok(false);
+                    }
+                    EventMsg::StreamError(StreamErrorEvent { message, .. }) => {
+                        warn!("Hidden session title rollback stream failed: {message}");
+                        return Ok(false);
+                    }
+                    _ => {}
+                }
+            }
+        };
+
+        match tokio::time::timeout(SESSION_TITLE_ROLLBACK_TIMEOUT, rollback).await {
+            Ok(Ok(rolled_back)) => rolled_back,
+            Ok(Err(err)) => {
+                warn!("Failed to drain hidden session title rollback: {err}");
+                false
+            }
+            Err(_) => {
+                warn!("Timed out rolling back hidden session title turn");
+                false
+            }
+        }
     }
 
     fn spawn_permission_request(
@@ -1427,6 +1633,11 @@ impl PromptState {
                 ..
             }) => {
                 info!("Item started with thread_id: {thread_id}, turn_id: {turn_id}, item: {item:?}");
+                if let TurnItem::AgentMessage(message) = &item
+                    && is_commentary_phase(message.phase.as_ref())
+                {
+                    self.commentary_message_item_ids.insert(message.id.clone());
+                }
             }
             EventMsg::UserMessage(UserMessageEvent {
                 message,
@@ -1445,6 +1656,9 @@ impl PromptState {
                 ..
             }) => {
                 info!("Agent message content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, delta: {delta:?}");
+                if self.commentary_message_item_ids.contains(&item_id) {
+                    return;
+                }
                 self.seen_message_deltas = true;
                 self.agent_message_text.push_str(&delta);
                 client.send_agent_text(delta);
@@ -1481,11 +1695,14 @@ impl PromptState {
             }
             EventMsg::AgentMessage(AgentMessageEvent {
                 message,
-                phase: _,
+                phase,
                 memory_citation: _,
                 ..
             }) => {
                 info!("Agent message (non-delta) received: {message:?}");
+                if is_commentary_phase(phase.as_ref()) {
+                    return;
+                }
                 // We didn't receive this message via streaming
                 if !std::mem::take(&mut self.seen_message_deltas) {
                     if self.agent_message_text.is_empty() {
@@ -1795,7 +2012,7 @@ impl PromptState {
 
             EventMsg::ContextCompacted(..) => {
                 info!("Context compacted");
-                client.send_agent_text("Context compacted\n".to_string());
+                client.send_context_compacted();
             }
             EventMsg::RequestPermissions(event) => {
                 info!("Request permissions: {} {}", event.call_id, event.turn_id);
@@ -3025,6 +3242,21 @@ impl SessionClient {
         ));
     }
 
+    fn send_context_compacted(&self) {
+        let notification = SessionNotification::new(
+            self.session_id.clone(),
+            SessionUpdate::SessionInfoUpdate(SessionInfoUpdate::new()),
+        )
+        .meta(Meta::from_iter([(
+            KODEX_CONTEXT_COMPACTED_META_KEY.to_owned(),
+            json!({}),
+        )]));
+
+        if let Err(e) = self.client.send_session_notification(notification) {
+            error!("Failed to send context compaction notification: {:?}", e);
+        }
+    }
+
     fn send_tool_call(&self, tool_call: ToolCall) {
         self.send_notification(SessionUpdate::ToolCall(tool_call));
     }
@@ -3877,9 +4109,12 @@ impl<A: Auth> ThreadActor<A> {
             }
             EventMsg::AgentMessage(AgentMessageEvent {
                 message,
-                phase: _,
+                phase,
                 memory_citation: _,
             }) => {
+                if is_commentary_phase(phase.as_ref()) {
+                    return;
+                }
                 self.client.send_agent_text(message.clone());
             }
             EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
@@ -4693,6 +4928,10 @@ fn extract_slash_command(content: &[UserInput]) -> Option<(&str, &str)> {
     Some((name, rest))
 }
 
+fn is_commentary_phase(phase: Option<&MessagePhase>) -> bool {
+    matches!(phase, Some(MessagePhase::Commentary))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -4704,6 +4943,7 @@ mod tests {
     use agent_client_protocol::schema::{RequestPermissionResponse, TextContent};
     use codex_core::{config::ConfigOverrides, test_support::all_model_presets};
     use codex_protocol::config_types::ModeKind;
+    use codex_protocol::items::AgentMessageItem;
     use codex_protocol::{ThreadId, protocol::ThreadGoal};
     use tokio::sync::{Mutex, Notify, mpsc::UnboundedSender};
 
@@ -4732,6 +4972,74 @@ mod tests {
                 ..
             }) if text == "Hi"
         ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn commentary_phase_agent_message_is_not_sent_as_chat() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, _handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["commentary-only".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(!notifications.iter().any(|notification| {
+            matches!(
+                &notification.update,
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) if text.contains("Need patch")
+            )
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn commentary_phase_deltas_do_not_suppress_final_answer() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, _handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(
+                session_id.clone(),
+                vec!["commentary-delta-then-final".into()],
+            ),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(!notifications.iter().any(|notification| {
+            matches!(
+                &notification.update,
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) if text.contains("Need internal note")
+            )
+        }));
+        assert!(notifications.iter().any(|notification| {
+            matches!(
+                &notification.update,
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) if text == "Final answer."
+            )
+        }));
 
         Ok(())
     }
@@ -4864,6 +5172,12 @@ mod tests {
                     ..
                 }) if text == "Compact task completed"
             )
+        }));
+        assert!(notifications.iter().any(|notification| {
+            notification
+                .meta
+                .as_ref()
+                .is_some_and(|meta| meta.contains_key(KODEX_CONTEXT_COMPACTED_META_KEY))
         }));
         let ops = thread.ops.lock().unwrap();
         assert_eq!(ops.as_slice(), &[Op::Compact]);
@@ -5331,6 +5645,30 @@ mod tests {
         }
     }
 
+    struct FailingSessionTitleGenerator {
+        calls: AtomicUsize,
+    }
+
+    impl FailingSessionTitleGenerator {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl SessionTitleGenerator for FailingSessionTitleGenerator {
+        fn generate_title(
+            &self,
+            _session_id: &SessionId,
+            _prompt_text: &str,
+            _response_text: Option<&str>,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<String>>> + Send + '_>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err(anyhow::anyhow!("403 Forbidden")) })
+        }
+    }
+
     struct StubCodexThread {
         current_id: AtomicUsize,
         active_prompt_id: std::sync::Mutex<Option<String>>,
@@ -5384,7 +5722,33 @@ mod tests {
                         }
                         drop(first_user_message);
 
-                        if prompt == "parallel-exec" {
+                        if prompt.starts_with(SESSION_TITLE_INSTRUCTIONS) {
+                            let turn_id = id.to_string();
+                            let title = "WOA Title Fix".to_string();
+                            let send = |msg| {
+                                self.op_tx
+                                    .send(Event {
+                                        id: id.to_string(),
+                                        msg,
+                                    })
+                                    .unwrap();
+                            };
+                            send(EventMsg::AgentMessageContentDelta(
+                                AgentMessageContentDeltaEvent {
+                                    thread_id: id.to_string(),
+                                    turn_id: turn_id.clone(),
+                                    item_id: id.to_string(),
+                                    delta: title.clone(),
+                                },
+                            ));
+                            send(EventMsg::TurnComplete(TurnCompleteEvent {
+                                last_agent_message: Some(title),
+                                turn_id,
+                                completed_at: None,
+                                duration_ms: None,
+                                time_to_first_token_ms: None,
+                            }));
+                        } else if prompt == "parallel-exec" {
                             // Emit interleaved exec events: Begin A, Begin B, End A, End B
                             let turn_id = id.to_string();
                             let cwd = std::env::current_dir().unwrap();
@@ -5544,6 +5908,84 @@ mod tests {
                                     }),
                                 })
                                 .unwrap();
+                        } else if prompt == "commentary-only" {
+                            let turn_id = id.to_string();
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg: EventMsg::AgentMessage(AgentMessageEvent {
+                                        message: "Need patch.".to_string(),
+                                        phase: Some(MessagePhase::Commentary),
+                                        memory_citation: None,
+                                    }),
+                                })
+                                .unwrap();
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                                        last_agent_message: None,
+                                        turn_id,
+                                        completed_at: None,
+                                        duration_ms: None,
+                                        time_to_first_token_ms: None,
+                                    }),
+                                })
+                                .unwrap();
+                        } else if prompt == "commentary-delta-then-final" {
+                            let turn_id = id.to_string();
+                            let commentary_item_id = "commentary-item".to_string();
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg: EventMsg::ItemStarted(ItemStartedEvent {
+                                        thread_id: ThreadId::default(),
+                                        turn_id: turn_id.clone(),
+                                        item: TurnItem::AgentMessage(AgentMessageItem {
+                                            id: commentary_item_id.clone(),
+                                            content: vec![],
+                                            phase: Some(MessagePhase::Commentary),
+                                            memory_citation: None,
+                                        }),
+                                        started_at_ms: 0,
+                                    }),
+                                })
+                                .unwrap();
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg: EventMsg::AgentMessageContentDelta(
+                                        AgentMessageContentDeltaEvent {
+                                            thread_id: id.to_string(),
+                                            turn_id: turn_id.clone(),
+                                            item_id: commentary_item_id,
+                                            delta: "Need internal note.".to_string(),
+                                        },
+                                    ),
+                                })
+                                .unwrap();
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg: EventMsg::AgentMessage(AgentMessageEvent {
+                                        message: "Final answer.".to_string(),
+                                        phase: Some(MessagePhase::FinalAnswer),
+                                        memory_citation: None,
+                                    }),
+                                })
+                                .unwrap();
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                                        last_agent_message: None,
+                                        turn_id,
+                                        completed_at: None,
+                                        duration_ms: None,
+                                        time_to_first_token_ms: None,
+                                    }),
+                                })
+                                .unwrap();
                         } else if prompt == "approval-block" {
                             self.op_tx
                                 .send(Event {
@@ -5624,6 +6066,14 @@ mod tests {
                         self.op_tx
                             .send(Event {
                                 id: id.to_string(),
+                                msg: EventMsg::ContextCompacted(
+                                    codex_protocol::protocol::ContextCompactedEvent {},
+                                ),
+                            })
+                            .unwrap();
+                        self.op_tx
+                            .send(Event {
+                                id: id.to_string(),
                                 msg: EventMsg::AgentMessage(AgentMessageEvent {
                                     message: "Compact task completed".to_string(),
                                     phase: None,
@@ -5677,6 +6127,16 @@ mod tests {
                                     duration_ms: None,
                                     time_to_first_token_ms: None,
                                 }),
+                            })
+                            .unwrap();
+                    }
+                    Op::ThreadRollback { num_turns } => {
+                        self.op_tx
+                            .send(Event {
+                                id: id.to_string(),
+                                msg: EventMsg::ThreadRolledBack(
+                                    codex_protocol::protocol::ThreadRolledBackEvent { num_turns },
+                                ),
                             })
                             .unwrap();
                     }
@@ -5913,6 +6373,58 @@ mod tests {
                 )
             }),
             "missing session info title update: {notifications:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn first_turn_falls_back_to_hidden_thread_title_when_generator_fails()
+    -> anyhow::Result<()> {
+        let title_generator = Arc::new(FailingSessionTitleGenerator::new());
+        let title_generator_trait: Arc<dyn SessionTitleGenerator> = title_generator.clone();
+        let (session_id, client, thread, message_tx, _handle) =
+            setup_with_title_generator(Some(title_generator_trait)).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["title-sync".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        assert_eq!(
+            thread.thread_name.lock().unwrap().as_deref(),
+            Some("WOA Title Fix")
+        );
+        assert_eq!(title_generator.calls.load(Ordering::SeqCst), 1);
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            Op::UserInput { items, .. }
+                if prompt_text_from_items(items)
+                    .is_some_and(|text| text.starts_with(SESSION_TITLE_INSTRUCTIONS))
+        )));
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, Op::ThreadRollback { num_turns } if *num_turns == 1))
+        );
+        drop(ops);
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(
+            notifications.iter().any(|notification| {
+                matches!(
+                    &notification.update,
+                    SessionUpdate::SessionInfoUpdate(update)
+                        if update.title.value().map(String::as_str) == Some("WOA Title Fix")
+                )
+            }),
+            "missing fallback session info title update: {notifications:?}"
         );
 
         Ok(())
@@ -6311,13 +6823,18 @@ mod tests {
             )],
             notify.clone(),
         ));
-        let session_client = SessionClient::with_client(session_id, client.clone(), Arc::default());
+        let session_client =
+            SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
         let thread = Arc::new(StubCodexThread::new());
         let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
         let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut prompt_state = PromptState::new(
             "submission-id".to_string(),
+            session_id.clone(),
             thread.clone(),
+            Arc::new(std::sync::Mutex::new(None)),
+            None,
+            None,
             message_tx,
             response_tx,
         );

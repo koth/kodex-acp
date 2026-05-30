@@ -106,6 +106,23 @@ impl CodexAgent {
         })
     }
 
+    pub async fn generate_session_title(
+        &self,
+        session_id: SessionId,
+        prompt_text: &str,
+        response_text: Option<&str>,
+    ) -> anyhow::Result<Option<String>> {
+        crate::thread::generate_session_title_with_model(
+            self.auth_manager.clone(),
+            Arc::new(self.thread_manager.get_models_manager()),
+            self.config.clone(),
+            &session_id,
+            prompt_text,
+            response_text,
+        )
+        .await
+    }
+
     /// Build and run the ACP agent, serving requests over the given transport.
     pub async fn serve(
         self: Arc<Self>,
