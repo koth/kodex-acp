@@ -86,6 +86,7 @@ use codex_utils_approval_presets::{ApprovalPreset, builtin_approval_presets};
 use futures::StreamExt;
 use heck::ToTitleCase;
 use itertools::Itertools;
+use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
@@ -127,6 +128,8 @@ const SESSION_TITLE_GENERATION_TIMEOUT: Duration = Duration::from_secs(20);
 const SESSION_TITLE_ROLLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const SESSION_TITLE_PROMPT_MAX_CHARS: usize = 4_000;
 const KODEX_CONTEXT_COMPACTED_META_KEY: &str = "kodex.ai/contextCompacted";
+const KODEX_MODEL_PROVIDER_MAP_ENV: &str = "KODEX_MODEL_PROVIDER_MAP";
+const KODEX_PROVIDER_VALUE_PREFIX: &str = "kodex-provider:";
 const SESSION_TITLE_INSTRUCTIONS: &str = r#"Generate a concise title for this coding session.
 
 Rules:
@@ -136,6 +139,14 @@ Rules:
 - Do not quote the title.
 - Do not copy the user's request verbatim.
 - Keep technical identifiers like API, ACP, session/list, and file names unchanged when clearer."#;
+
+#[derive(Debug, Clone, Deserialize)]
+struct KodexModelProviderEntry {
+    model: String,
+    #[serde(default)]
+    display_name: String,
+    provider: String,
+}
 
 fn session_mode_id_for_active_profile(profile_id: &str) -> Option<&'static str> {
     match profile_id {
@@ -3550,11 +3561,30 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn find_current_model(&self) -> Option<ModelId> {
+        let provider_entries = Self::kodex_model_provider_entries();
+        let mut used_provider_entries = vec![false; provider_entries.len()];
+        let active_provider = self.config.model_provider_id.clone();
         let model_presets = self.models_manager.list_models().await;
         let config_model = self.get_current_model().await;
-        let preset = model_presets
+        let (preset, provider) = model_presets
             .iter()
-            .find(|preset| preset.model == config_model)?;
+            .filter_map(|preset| {
+                let provider = Self::provider_for_preset_from_entries(
+                    &provider_entries,
+                    &mut used_provider_entries,
+                    &preset.model,
+                    &preset.display_name,
+                )
+                .unwrap_or_else(|| active_provider.clone());
+                Some((preset, provider))
+            })
+            .find(|(preset, provider)| preset.model == config_model && provider == &active_provider)
+            .or_else(|| {
+                model_presets
+                    .iter()
+                    .find(|preset| preset.model == config_model)
+                    .map(|preset| (preset, active_provider.clone()))
+            })?;
 
         let effort = self
             .config
@@ -3567,11 +3597,90 @@ impl<A: Auth> ThreadActor<A> {
             })
             .unwrap_or(preset.default_reasoning_effort);
 
-        Some(Self::model_id(&preset.id, effort))
+        Some(Self::model_id_for_provider(&preset.id, effort, &provider))
     }
 
-    fn model_id(id: &str, effort: ReasoningEffort) -> ModelId {
-        ModelId::new(format!("{id}/{effort}"))
+    fn model_id_for_provider(id: &str, effort: ReasoningEffort, provider: &str) -> ModelId {
+        ModelId::new(Self::encode_provider_value(
+            &format!("{id}/{effort}"),
+            provider,
+        ))
+    }
+
+    fn model_provider_meta(provider: &str) -> Meta {
+        let mut meta = Meta::new();
+        meta.insert("provider".to_string(), json!(provider));
+        meta
+    }
+
+    fn kodex_model_provider_entries() -> Vec<KodexModelProviderEntry> {
+        std::env::var(KODEX_MODEL_PROVIDER_MAP_ENV)
+            .ok()
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default()
+    }
+
+    fn provider_for_preset_from_entries(
+        entries: &[KodexModelProviderEntry],
+        used_entries: &mut [bool],
+        model: &str,
+        display_name: &str,
+    ) -> Option<String> {
+        entries.iter().enumerate().find_map(|(index, entry)| {
+            if used_entries.get(index).copied().unwrap_or(true) {
+                return None;
+            }
+            if entry.model == model || entry.display_name == display_name {
+                if let Some(used) = used_entries.get_mut(index) {
+                    *used = true;
+                }
+                Some(entry.provider.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn encode_provider_value(value: &str, provider: &str) -> String {
+        if value.starts_with(KODEX_PROVIDER_VALUE_PREFIX) || provider.trim().is_empty() {
+            value.to_string()
+        } else {
+            format!("{KODEX_PROVIDER_VALUE_PREFIX}{}:{value}", provider.trim())
+        }
+    }
+
+    fn decode_provider_value(value: &str) -> (Option<String>, String) {
+        let Some(rest) = value.strip_prefix(KODEX_PROVIDER_VALUE_PREFIX) else {
+            return (None, value.to_string());
+        };
+        let Some((provider, model)) = rest.split_once(':') else {
+            return (None, value.to_string());
+        };
+        let provider = provider.trim();
+        if provider.is_empty() {
+            (None, model.to_string())
+        } else {
+            (Some(provider.to_string()), model.to_string())
+        }
+    }
+
+    fn set_active_model_provider(&mut self, provider: &str) -> Result<(), Error> {
+        if provider == self.config.model_provider_id {
+            return Ok(());
+        }
+        let provider_config = self
+            .config
+            .model_providers
+            .get(provider)
+            .cloned()
+            .ok_or_else(|| {
+                Error::invalid_params().data(format!(
+                    "Unsupported provider for selected model: {provider}"
+                ))
+            })?;
+        self.config.model_provider_id = provider.to_string();
+        self.config.model_provider = provider_config;
+        Ok(())
     }
 
     fn parse_model_id(id: &ModelId) -> Option<(String, ReasoningEffort)> {
@@ -3602,39 +3711,67 @@ impl<A: Auth> ThreadActor<A> {
             );
         }
 
+        let provider_entries = Self::kodex_model_provider_entries();
+        let mut used_provider_entries = vec![false; provider_entries.len()];
+        let active_provider = self.config.model_provider_id.clone();
         let presets = self.models_manager.list_models().await;
 
         let current_model = self.get_current_model().await;
-        let current_preset = presets.iter().find(|p| p.model == current_model).cloned();
+        let preset_options = presets
+            .into_iter()
+            .filter(|model| model.show_in_picker || model.model == current_model)
+            .map(|preset| {
+                let provider = Self::provider_for_preset_from_entries(
+                    &provider_entries,
+                    &mut used_provider_entries,
+                    &preset.model,
+                    &preset.display_name,
+                )
+                .unwrap_or_else(|| active_provider.clone());
+                (preset, provider)
+            })
+            .collect::<Vec<_>>();
+        let current_preset = preset_options
+            .iter()
+            .find(|(preset, provider)| {
+                preset.model == current_model && provider == &active_provider
+            })
+            .or_else(|| {
+                preset_options
+                    .iter()
+                    .find(|(preset, _provider)| preset.model == current_model)
+            });
+        let current_value = current_preset
+            .map(|(preset, provider)| Self::encode_provider_value(&preset.id, provider))
+            .unwrap_or_else(|| Self::encode_provider_value(&current_model, &active_provider));
 
         let mut model_select_options = Vec::new();
 
         if current_preset.is_none() {
             // If no preset found, return the current model string as-is
-            model_select_options.push(SessionConfigSelectOption::new(
-                current_model.clone(),
-                current_model.clone(),
-            ));
+            model_select_options.push(
+                SessionConfigSelectOption::new(current_value.clone(), current_model.clone())
+                    .meta(Self::model_provider_meta(&active_provider)),
+            );
         };
 
-        model_select_options.extend(
-            presets
-                .into_iter()
-                .filter(|model| model.show_in_picker || model.model == current_model)
-                .map(|preset| {
-                    SessionConfigSelectOption::new(preset.id, preset.display_name)
-                        .description(preset.description)
-                }),
-        );
+        model_select_options.extend(preset_options.iter().map(|(preset, provider)| {
+            SessionConfigSelectOption::new(
+                Self::encode_provider_value(&preset.id, provider),
+                preset.display_name.clone(),
+            )
+            .description(preset.description.clone())
+            .meta(Self::model_provider_meta(provider))
+        }));
 
         options.push(
-            SessionConfigOption::select("model", "Model", current_model, model_select_options)
+            SessionConfigOption::select("model", "Model", current_value, model_select_options)
                 .category(SessionConfigOptionCategory::Model)
                 .description("Choose which model Codex should use"),
         );
 
         // Reasoning effort selector (only if the current preset exists and has >1 supported effort)
-        if let Some(preset) = current_preset
+        if let Some((preset, _provider)) = current_preset
             && preset.supported_reasoning_efforts.len() > 1
         {
             let supported = &preset.supported_reasoning_efforts;
@@ -3711,10 +3848,13 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn handle_set_config_model(&mut self, value: SessionConfigValueId) -> Result<(), Error> {
-        let model_id = value.0;
+        let (selected_provider, model_id) = Self::decode_provider_value(value.0.as_ref());
+        if let Some(provider) = selected_provider.as_deref() {
+            self.set_active_model_provider(provider)?;
+        }
 
         let presets = self.models_manager.list_models().await;
-        let preset = presets.iter().find(|p| p.id.as_str() == &*model_id);
+        let preset = presets.iter().find(|p| p.id.as_str() == model_id.as_str());
 
         let model_to_use = preset
             .map(|p| p.model.clone())
@@ -3815,13 +3955,23 @@ impl<A: Auth> ThreadActor<A> {
     async fn models(&self) -> Result<SessionModelState, Error> {
         let mut available_models = Vec::new();
         let config_model = self.get_current_model().await;
+        let provider_entries = Self::kodex_model_provider_entries();
+        let mut used_provider_entries = vec![false; provider_entries.len()];
+        let active_provider = self.config.model_provider_id.clone();
 
         let current_model_id = if let Some(model_id) = self.find_current_model().await {
             model_id
         } else {
             // If no preset found, return the current model string as-is
-            let model_id = ModelId::new(self.get_current_model().await);
-            available_models.push(ModelInfo::new(model_id.clone(), model_id.to_string()));
+            let current_model = self.get_current_model().await;
+            let model_id = ModelId::new(Self::encode_provider_value(
+                &current_model,
+                &active_provider,
+            ));
+            available_models.push(
+                ModelInfo::new(model_id.clone(), current_model)
+                    .meta(Self::model_provider_meta(&active_provider)),
+            );
             model_id
         };
 
@@ -3829,16 +3979,28 @@ impl<A: Auth> ThreadActor<A> {
             self.models_manager
                 .list_models()
                 .await
-                .iter()
+                .into_iter()
                 .filter(|model| model.show_in_picker || model.model == config_model)
                 .flat_map(|preset| {
-                    preset.supported_reasoning_efforts.iter().map(|effort| {
-                        ModelInfo::new(
-                            Self::model_id(&preset.id, effort.effort),
-                            format!("{} ({})", preset.display_name, effort.effort),
-                        )
-                        .description(format!("{} {}", preset.description, effort.description))
-                    })
+                    let provider = Self::provider_for_preset_from_entries(
+                        &provider_entries,
+                        &mut used_provider_entries,
+                        &preset.model,
+                        &preset.display_name,
+                    )
+                    .unwrap_or_else(|| active_provider.clone());
+                    preset
+                        .supported_reasoning_efforts
+                        .iter()
+                        .map(|effort| {
+                            ModelInfo::new(
+                                Self::model_id_for_provider(&preset.id, effort.effort, &provider),
+                                format!("{} ({})", preset.display_name, effort.effort),
+                            )
+                            .description(format!("{} {}", preset.description, effort.description))
+                            .meta(Self::model_provider_meta(&provider))
+                        })
+                        .collect::<Vec<_>>()
                 }),
         );
 
@@ -4013,18 +4175,25 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn handle_set_model(&mut self, model: ModelId) -> Result<(), Error> {
+        let (selected_provider, model_id) = Self::decode_provider_value(model.0.as_ref());
+        if let Some(provider) = selected_provider.as_deref() {
+            self.set_active_model_provider(provider)?;
+        }
+
         // Try parsing as preset format, otherwise use as-is, fallback to config
-        let (model_to_use, effort_to_use) = if let Some((m, e)) = Self::parse_model_id(&model) {
-            (m, Some(e))
-        } else {
-            let model_str = model.0.to_string();
-            let fallback = if !model_str.is_empty() {
-                model_str
+        let decoded_model = ModelId::new(model_id);
+        let (model_to_use, effort_to_use) =
+            if let Some((m, e)) = Self::parse_model_id(&decoded_model) {
+                (m, Some(e))
             } else {
-                self.get_current_model().await
+                let model_str = decoded_model.0.to_string();
+                let fallback = if !model_str.is_empty() {
+                    model_str
+                } else {
+                    self.get_current_model().await
+                };
+                (fallback, self.config.model_reasoning_effort)
             };
-            (fallback, self.config.model_reasoning_effort)
-        };
 
         if model_to_use.is_empty() {
             return Err(Error::invalid_params().data("No model parsed or configured"));

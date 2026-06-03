@@ -40,6 +40,7 @@ struct TitleHelperResponse {
 pub async fn run_main(
     codex_linux_sandbox_exe: Option<PathBuf>,
     cli_config_overrides: CliConfigOverrides,
+    port: Option<u16>,
 ) -> std::io::Result<()> {
     init_tracing();
     if std::env::var_os(TITLE_HELPER_ENV).is_some() {
@@ -50,11 +51,29 @@ pub async fn run_main(
 
     let agent = Arc::new(codex_agent::CodexAgent::new(config, codex_linux_sandbox_exe).await?);
 
-    let stdin = tokio::io::stdin().compat();
-    let stdout = tokio::io::stdout().compat_write();
+    if let Some(port) = port {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("failed to bind ACP TCP listener on 127.0.0.1:{port}: {e}"),
+                )
+            })?;
+        let (stream, _) = listener.accept().await?;
+        let (read, write) = stream.into_split();
+        agent
+            .serve(ByteStreams::new(write.compat_write(), read.compat()))
+            .await
+            .map_err(|e| std::io::Error::other(format!("ACP error: {e}")))?;
+        return Ok(());
+    }
 
     agent
-        .serve(ByteStreams::new(stdout, stdin))
+        .serve(ByteStreams::new(
+            tokio::io::stdout().compat_write(),
+            tokio::io::stdin().compat(),
+        ))
         .await
         .map_err(|e| std::io::Error::other(format!("ACP error: {e}")))?;
 
