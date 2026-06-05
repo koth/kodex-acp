@@ -128,6 +128,7 @@ const SESSION_TITLE_GENERATION_TIMEOUT: Duration = Duration::from_secs(20);
 const SESSION_TITLE_ROLLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const SESSION_TITLE_PROMPT_MAX_CHARS: usize = 4_000;
 const KODEX_CONTEXT_COMPACTED_META_KEY: &str = "kodex.ai/contextCompacted";
+const KODEX_PERMISSION_GUIDANCE_META_KEY: &str = "kodex.ai/permissionGuidance";
 const KODEX_MODEL_PROVIDER_MAP_ENV: &str = "KODEX_MODEL_PROVIDER_MAP";
 const KODEX_PROVIDER_VALUE_PREFIX: &str = "kodex-provider:";
 const SESSION_TITLE_INSTRUCTIONS: &str = r#"Generate a concise title for this coding session.
@@ -1022,6 +1023,38 @@ fn format_thread_goal_update(event: &ThreadGoalUpdatedEvent) -> String {
     }
 }
 
+fn permission_guidance_from_response(response: &RequestPermissionResponse) -> Option<String> {
+    response
+        .meta
+        .as_ref()
+        .and_then(permission_guidance_from_meta)
+        .or_else(|| match &response.outcome {
+            RequestPermissionOutcome::Selected(SelectedPermissionOutcome { meta, .. }) => {
+                meta.as_ref().and_then(permission_guidance_from_meta)
+            }
+            RequestPermissionOutcome::Cancelled | _ => None,
+        })
+}
+
+fn permission_guidance_from_meta(meta: &Meta) -> Option<String> {
+    meta.get(KODEX_PERMISSION_GUIDANCE_META_KEY)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|guidance| !guidance.is_empty())
+        .map(str::to_string)
+}
+
+fn permission_guidance_followup(
+    decision: &ReviewDecision,
+    guidance: Option<String>,
+) -> Option<String> {
+    if matches!(decision, ReviewDecision::Abort | ReviewDecision::TimedOut) {
+        guidance
+    } else {
+        None
+    }
+}
+
 enum SubmissionState {
     /// User prompts, including slash commands like /init, /review, /compact.
     Prompt(PromptState),
@@ -1046,7 +1079,7 @@ impl SubmissionState {
         interaction_id: u64,
         request_key: String,
         response: Result<RequestPermissionResponse, Error>,
-    ) -> Result<(), Error> {
+    ) -> Result<Option<String>, Error> {
         match self {
             Self::Prompt(state) => {
                 state
@@ -1440,27 +1473,28 @@ impl PromptState {
         interaction_id: u64,
         request_key: String,
         response: Result<RequestPermissionResponse, Error>,
-    ) -> Result<(), Error> {
+    ) -> Result<Option<String>, Error> {
         let Some(pending_interaction_id) = self
             .pending_permission_interactions
             .get(&request_key)
             .map(|interaction| interaction.id)
         else {
             warn!("Ignoring permission response for unknown request key: {request_key}");
-            return Ok(());
+            return Ok(None);
         };
 
         if pending_interaction_id != interaction_id {
             warn!("Ignoring stale permission response for request key: {request_key}");
-            return Ok(());
+            return Ok(None);
         }
 
         let Some(interaction) = self.pending_permission_interactions.remove(&request_key) else {
             warn!("Ignoring permission response for unknown request key: {request_key}");
-            return Ok(());
+            return Ok(None);
         };
         let pending_request = interaction.request;
         let response = response?;
+        let permission_guidance = permission_guidance_from_response(&response);
 
         match pending_request {
             PendingPermissionRequest::Exec {
@@ -1483,10 +1517,11 @@ impl PromptState {
                     .submit(Op::ExecApproval {
                         id: approval_id,
                         turn_id: Some(turn_id),
-                        decision,
+                        decision: decision.clone(),
                     })
                     .await
                     .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+                Ok(permission_guidance_followup(&decision, permission_guidance))
             }
             PendingPermissionRequest::Patch {
                 call_id,
@@ -1506,10 +1541,11 @@ impl PromptState {
                 self.thread
                     .submit(Op::PatchApproval {
                         id: call_id,
-                        decision,
+                        decision: decision.clone(),
                     })
                     .await
                     .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+                Ok(permission_guidance_followup(&decision, permission_guidance))
             }
             PendingPermissionRequest::RequestPermissions {
                 call_id,
@@ -1550,6 +1586,7 @@ impl PromptState {
                     })
                     .await
                     .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+                Ok(None)
             }
             PendingPermissionRequest::McpElicitation {
                 server_name,
@@ -1577,10 +1614,9 @@ impl PromptState {
                     })
                     .await
                     .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+                Ok(None)
             }
         }
-
-        Ok(())
     }
 
     #[expect(clippy::too_many_lines)]
@@ -3490,24 +3526,37 @@ impl<A: Auth> ThreadActor<A> {
                 request_key,
                 response,
             } => {
-                let Some(submission) = self.submissions.get_mut(&submission_id) else {
-                    warn!(
-                        "Ignoring permission response for unknown submission ID: {submission_id}"
-                    );
-                    return;
+                let result = {
+                    let Some(submission) = self.submissions.get_mut(&submission_id) else {
+                        warn!(
+                            "Ignoring permission response for unknown submission ID: {submission_id}"
+                        );
+                        return;
+                    };
+
+                    submission
+                        .handle_permission_request_resolved(
+                            &self.client,
+                            interaction_id,
+                            request_key,
+                            response,
+                        )
+                        .await
                 };
 
-                if let Err(err) = submission
-                    .handle_permission_request_resolved(
-                        &self.client,
-                        interaction_id,
-                        request_key,
-                        response,
-                    )
-                    .await
-                {
-                    submission.detach_pending_interactions();
-                    submission.fail(err);
+                match result {
+                    Ok(Some(guidance)) => {
+                        if let Err(err) = self.submit_permission_guidance_followup(guidance).await {
+                            warn!("Failed to submit permission guidance follow-up: {err:?}");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        if let Some(submission) = self.submissions.get_mut(&submission_id) {
+                            submission.detach_pending_interactions();
+                            submission.fail(err);
+                        }
+                    }
                 }
             }
         }
@@ -4123,6 +4172,45 @@ impl<A: Auth> ThreadActor<A> {
         self.submissions.insert(submission_id, state);
 
         Ok(response_rx)
+    }
+
+    async fn submit_permission_guidance_followup(&mut self, guidance: String) -> Result<(), Error> {
+        let guidance = guidance.trim();
+        if guidance.is_empty() {
+            return Ok(());
+        }
+
+        let items = vec![UserInput::Text {
+            text: guidance.to_string(),
+            text_elements: vec![],
+        }];
+        let submission_id = self
+            .thread
+            .submit(Op::UserInput {
+                items: items.clone(),
+                final_output_json_schema: None,
+                environments: None,
+                responsesapi_client_metadata: None,
+            })
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
+
+        info!("Submitted permission guidance follow-up with submission_id: {submission_id}");
+
+        let (response_tx, _response_rx) = oneshot::channel();
+        let state = SubmissionState::Prompt(PromptState::new(
+            submission_id.clone(),
+            self.client.session_id.clone(),
+            self.thread.clone(),
+            self.session_title.clone(),
+            self.title_generator.clone(),
+            prompt_text_from_items(&items),
+            self.resolution_tx.clone(),
+            response_tx,
+        ));
+        self.submissions.insert(submission_id, state);
+
+        Ok(())
     }
 
     async fn handle_set_mode(&mut self, mode: SessionModeId) -> Result<(), Error> {
@@ -7074,6 +7162,84 @@ mod tests {
             ops.is_empty(),
             "late permission response should not submit an approval: {ops:?}"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn permission_abort_guidance_submits_followup_prompt() -> anyhow::Result<()> {
+        let session_id = SessionId::new("test");
+        let client = Arc::new(StubClient::with_permission_responses(vec![
+            RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+                SelectedPermissionOutcome::new("abort"),
+            ))
+            .meta(Meta::from_iter([(
+                KODEX_PERMISSION_GUIDANCE_META_KEY.to_string(),
+                json!("Explain the command first and avoid deleting files."),
+            )])),
+        ]));
+        let session_client =
+            SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
+        let conversation = Arc::new(StubCodexThread::new());
+        let models_manager = Arc::new(StubModelsManager);
+        let config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
+        let actor = ThreadActor::new(
+            StubAuth,
+            session_client,
+            conversation.clone(),
+            models_manager,
+            config,
+            None,
+            message_rx,
+            resolution_tx,
+            resolution_rx,
+        );
+        let handle = tokio::spawn(actor.spawn());
+        let thread = Thread {
+            thread: conversation.clone(),
+            message_tx,
+            _handle: handle,
+        };
+
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+        thread.message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id, vec!["approval-block".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+        let _stop_reason_rx = prompt_response_rx.await??;
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                if conversation.ops.lock().unwrap().len() >= 3 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+
+        let ops = conversation.ops.lock().unwrap();
+        assert!(matches!(
+            ops.get(1),
+            Some(Op::ExecApproval {
+                id,
+                turn_id: Some(_),
+                decision: ReviewDecision::Abort,
+            }) if id == "approval-id"
+        ));
+        assert!(matches!(
+            ops.get(2),
+            Some(Op::UserInput { items, .. })
+                if prompt_text_from_items(items)
+                    .as_deref()
+                    == Some("Explain the command first and avoid deleting files.")
+        ));
 
         Ok(())
     }
