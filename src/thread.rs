@@ -47,8 +47,8 @@ use codex_protocol::{
     items::TurnItem,
     mcp::CallToolResult,
     models::{
-        AdditionalPermissionProfile, ContentItem, MessagePhase, PermissionProfile, ResponseItem,
-        WebSearchAction,
+        ActivePermissionProfile, AdditionalPermissionProfile, ContentItem, MessagePhase,
+        PermissionProfile, ResponseItem, WebSearchAction,
     },
     openai_models::{ModelInfo as CodexModelInfo, ModelPreset, ReasoningEffort},
     parse_command::ParsedCommand,
@@ -70,12 +70,17 @@ use codex_protocol::{
         ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision,
         ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem, SessionSource,
         StreamErrorEvent, TerminalInteractionEvent, ThreadGoalStatus, ThreadGoalUpdatedEvent,
-        TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
-        ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
+        ThreadSettingsOverrides, TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent,
+        TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent,
+        WebSearchBeginEvent, WebSearchEndEvent,
     },
     request_permissions::{
         PermissionGrantScope, RequestPermissionProfile, RequestPermissionsEvent,
         RequestPermissionsResponse,
+    },
+    request_user_input::{
+        RequestUserInputAnswer, RequestUserInputEvent, RequestUserInputQuestion,
+        RequestUserInputResponse,
     },
     user_input::UserInput,
 };
@@ -127,8 +132,10 @@ const SESSION_TITLE_MAX_CHARS: usize = 60;
 const SESSION_TITLE_GENERATION_TIMEOUT: Duration = Duration::from_secs(20);
 const SESSION_TITLE_ROLLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const SESSION_TITLE_PROMPT_MAX_CHARS: usize = 4_000;
+const KODEX_CONTEXT_COMPACTION_META_KEY: &str = "kodex.ai/contextCompaction";
 const KODEX_CONTEXT_COMPACTED_META_KEY: &str = "kodex.ai/contextCompacted";
 const KODEX_PERMISSION_GUIDANCE_META_KEY: &str = "kodex.ai/permissionGuidance";
+const KODEX_USER_INPUT_ANSWERS_META_KEY: &str = "kodex.ai/userInputAnswers";
 const KODEX_MODEL_PROVIDER_MAP_ENV: &str = "KODEX_MODEL_PROVIDER_MAP";
 const KODEX_PROVIDER_VALUE_PREFIX: &str = "kodex-provider:";
 const SESSION_TITLE_INSTRUCTIONS: &str = r#"Generate a concise title for this coding session.
@@ -154,6 +161,15 @@ fn session_mode_id_for_active_profile(profile_id: &str) -> Option<&'static str> 
         CODEX_READ_ONLY_PROFILE_ID => Some("read-only"),
         CODEX_WORKSPACE_PROFILE_ID => Some("auto"),
         CODEX_DANGER_NO_SANDBOX_PROFILE_ID => Some("full-access"),
+        _ => None,
+    }
+}
+
+fn active_profile_id_for_session_mode(mode_id: &str) -> Option<&'static str> {
+    match mode_id {
+        "read-only" => Some(CODEX_READ_ONLY_PROFILE_ID),
+        "auto" => Some(CODEX_WORKSPACE_PROFILE_ID),
+        "full-access" => Some(CODEX_DANGER_NO_SANDBOX_PROFILE_ID),
         _ => None,
     }
 }
@@ -218,7 +234,7 @@ fn current_session_mode_id(config: &Config) -> Option<SessionModeId> {
 
     if let Some(preset) = APPROVAL_PRESETS.iter().find(|preset| {
         approval_matches_current_config(preset, config)
-            && preset.permission_profile == config.permissions.permission_profile()
+            && preset.permission_profile == *config.permissions.permission_profile()
     }) {
         return Some(SessionModeId::new(preset.id));
     }
@@ -287,7 +303,7 @@ impl CodexThreadImpl for CodexThread {
         Box::pin(async move {
             self.update_thread_metadata(
                 ThreadMetadataPatch {
-                    name: Some(name),
+                    name: Some(Some(name)),
                     ..Default::default()
                 },
                 /*include_archived*/ false,
@@ -402,6 +418,7 @@ impl SessionTitleGenerator for ModelSessionTitleGenerator {
                 /*enable_request_compression*/ false,
                 /*include_timing_metrics*/ false,
                 /*beta_features_header*/ None,
+                /*attestation_provider*/ None,
             );
 
             let telemetry = SessionTelemetry::new(
@@ -723,6 +740,10 @@ enum PendingPermissionRequest {
         request_id: codex_protocol::mcp::RequestId,
         option_map: HashMap<String, ResolvedMcpElicitation>,
     },
+    UserInput {
+        id: String,
+        option_map: HashMap<String, ResolvedUserInputAnswer>,
+    },
 }
 
 struct PendingPermissionInteraction {
@@ -763,6 +784,13 @@ impl ResolvedMcpElicitation {
     }
 }
 
+#[derive(Clone)]
+struct ResolvedUserInputAnswer {
+    question_id: String,
+    answer: Option<String>,
+    use_guidance: bool,
+}
+
 fn exec_request_key(call_id: &str) -> String {
     format!("exec:{call_id}")
 }
@@ -780,6 +808,10 @@ fn mcp_elicitation_request_key(
     request_id: &codex_protocol::mcp::RequestId,
 ) -> String {
     format!("mcp-elicitation:{server_name}:{request_id}")
+}
+
+fn user_input_request_key(id: &str, call_id: &str) -> String {
+    format!("user-input:{id}:{call_id}")
 }
 
 const MCP_TOOL_APPROVAL_KIND_KEY: &str = "codex_approval_kind";
@@ -1012,6 +1044,8 @@ fn format_thread_goal_update(event: &ThreadGoalUpdatedEvent) -> String {
         ThreadGoalStatus::Active => "active",
         ThreadGoalStatus::Paused => "paused",
         ThreadGoalStatus::BudgetLimited => "budget limited",
+        ThreadGoalStatus::Blocked => "blocked",
+        ThreadGoalStatus::UsageLimited => "usage limited",
         ThreadGoalStatus::Complete => "complete",
     };
 
@@ -1042,6 +1076,79 @@ fn permission_guidance_from_meta(meta: &Meta) -> Option<String> {
         .map(str::trim)
         .filter(|guidance| !guidance.is_empty())
         .map(str::to_string)
+}
+
+fn user_input_response_from_permission_response(
+    response: &RequestPermissionResponse,
+) -> Option<RequestUserInputResponse> {
+    response
+        .meta
+        .as_ref()
+        .and_then(user_input_response_from_meta)
+        .or_else(|| match &response.outcome {
+            RequestPermissionOutcome::Selected(SelectedPermissionOutcome { meta, .. }) => {
+                meta.as_ref().and_then(user_input_response_from_meta)
+            }
+            RequestPermissionOutcome::Cancelled | _ => None,
+        })
+}
+
+fn user_input_response_from_meta(meta: &Meta) -> Option<RequestUserInputResponse> {
+    let value = meta.get(KODEX_USER_INPUT_ANSWERS_META_KEY)?;
+    let answers = value
+        .get("answers")
+        .and_then(serde_json::Value::as_object)
+        .or_else(|| value.as_object())?;
+    let answers = answers
+        .iter()
+        .filter_map(|(question_id, value)| {
+            let values = value
+                .as_array()?
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|answer| !answer.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            (!values.is_empty()).then(|| {
+                (
+                    question_id.clone(),
+                    RequestUserInputAnswer { answers: values },
+                )
+            })
+        })
+        .collect::<HashMap<_, _>>();
+    (!answers.is_empty()).then_some(RequestUserInputResponse { answers })
+}
+
+fn empty_user_input_response() -> RequestUserInputResponse {
+    RequestUserInputResponse {
+        answers: HashMap::new(),
+    }
+}
+
+fn user_input_response_from_answer(
+    answer: &ResolvedUserInputAnswer,
+    guidance: Option<String>,
+) -> RequestUserInputResponse {
+    let selected_answer = if answer.use_guidance {
+        guidance
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .or_else(|| answer.answer.clone())
+            .unwrap_or_default()
+    } else {
+        answer.answer.clone().unwrap_or_default()
+    };
+
+    RequestUserInputResponse {
+        answers: HashMap::from([(
+            answer.question_id.clone(),
+            RequestUserInputAnswer {
+                answers: vec![selected_answer],
+            },
+        )]),
+    }
 }
 
 fn permission_guidance_followup(
@@ -1282,6 +1389,8 @@ impl PromptState {
                 final_output_json_schema: None,
                 environments: None,
                 responsesapi_client_metadata: None,
+                additional_context: Default::default(),
+                thread_settings: Default::default(),
             })
             .await?;
 
@@ -1495,6 +1604,7 @@ impl PromptState {
         let pending_request = interaction.request;
         let response = response?;
         let permission_guidance = permission_guidance_from_response(&response);
+        let user_input_response = user_input_response_from_permission_response(&response);
 
         match pending_request {
             PendingPermissionRequest::Exec {
@@ -1612,6 +1722,24 @@ impl PromptState {
                         content: response.content,
                         meta: response.meta,
                     })
+                    .await
+                    .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+                Ok(None)
+            }
+            PendingPermissionRequest::UserInput { id, option_map } => {
+                let response = user_input_response.unwrap_or_else(|| match response.outcome {
+                    RequestPermissionOutcome::Selected(SelectedPermissionOutcome {
+                        option_id,
+                        ..
+                    }) => option_map
+                        .get(option_id.0.as_ref())
+                        .map(|answer| user_input_response_from_answer(answer, permission_guidance))
+                        .unwrap_or_else(empty_user_input_response),
+                    RequestPermissionOutcome::Cancelled | _ => empty_user_input_response(),
+                });
+
+                self.thread
+                    .submit(Op::UserInputAnswer { id, response })
                     .await
                     .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
                 Ok(None)
@@ -2069,6 +2197,17 @@ impl PromptState {
                     drop(response_tx.send(Err(err)));
                 }
             }
+            EventMsg::RequestUserInput(event) => {
+                info!(
+                    "Request user input: {} {}",
+                    event.call_id, event.turn_id
+                );
+                if let Err(err) = self.request_user_input(client, event).await
+                    && let Some(response_tx) = self.response_tx.take()
+                {
+                    drop(response_tx.send(Err(err)));
+                }
+            }
             EventMsg::GuardianAssessment(event) => {
                 info!(
                     "Guardian assessment: id={}, status={:?}, turn_id={}",
@@ -2082,9 +2221,9 @@ impl PromptState {
             | EventMsg::ThreadRolledBack(..)
             | EventMsg::HookStarted(..)
             | EventMsg::HookCompleted(..)
-            | EventMsg::SkillsUpdateAvailable
             // we already have a way to diff the turn, so ignore
             | EventMsg::TurnDiff(..)
+            | EventMsg::ThreadSettingsApplied(..)
             // Old events
             | EventMsg::RawResponseItem(..)
             | EventMsg::SessionConfigured(..)
@@ -2105,8 +2244,7 @@ impl PromptState {
             | EventMsg::CollabCloseEnd(..)
             | EventMsg::PlanDelta(..)=> {}
             e @ (EventMsg::RealtimeConversationListVoicesResponse(..)
-            | EventMsg::DeprecationNotice(..)
-            | EventMsg::RequestUserInput(..)) => {
+            | EventMsg::DeprecationNotice(..)) => {
                 warn!("Unexpected event: {:?}", e);
             }
         }
@@ -2919,7 +3057,7 @@ impl PromptState {
                 file_system
                     .entries
                     .iter()
-                    .filter(|entry| entry.access == FileSystemAccessMode::None),
+                    .filter(|entry| entry.access == FileSystemAccessMode::Deny),
             );
             if !denies.is_empty() {
                 content.push(format!("File System Denied Access: {denies}"));
@@ -2961,6 +3099,63 @@ impl PromptState {
                 PermissionOption::new("approved", "Yes", PermissionOptionKind::AllowOnce),
                 PermissionOption::new("abort", "No", PermissionOptionKind::RejectOnce),
             ],
+        );
+
+        Ok(())
+    }
+
+    async fn request_user_input(
+        &mut self,
+        client: &SessionClient,
+        event: RequestUserInputEvent,
+    ) -> Result<(), Error> {
+        let raw_input = serde_json::json!(&event);
+        let RequestUserInputEvent {
+            call_id,
+            turn_id,
+            questions,
+        } = event;
+        let answer_id = if turn_id.trim().is_empty() {
+            self.submission_id.clone()
+        } else {
+            turn_id
+        };
+        let (title, content, options, option_map) =
+            build_user_input_permission_request(&questions);
+        let content = if content.is_empty() {
+            None
+        } else {
+            Some(vec![content.into()])
+        };
+
+        if option_map.is_empty() {
+            self.thread
+                .submit(Op::UserInputAnswer {
+                    id: answer_id,
+                    response: empty_user_input_response(),
+                })
+                .await
+                .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+            return Ok(());
+        }
+
+        self.spawn_permission_request(
+            client,
+            user_input_request_key(&answer_id, &call_id),
+            PendingPermissionRequest::UserInput {
+                id: answer_id,
+                option_map,
+            },
+            ToolCallUpdate::new(
+                call_id,
+                ToolCallUpdateFields::new()
+                    .kind(ToolKind::Think)
+                    .status(ToolCallStatus::Pending)
+                    .title(title)
+                    .raw_input(raw_input)
+                    .content(content),
+            ),
+            options,
         );
 
         Ok(())
@@ -3023,6 +3218,124 @@ struct ExecPermissionOption {
     option_id: &'static str,
     permission_option: PermissionOption,
     decision: ReviewDecision,
+}
+
+fn build_user_input_permission_request(
+    questions: &[RequestUserInputQuestion],
+) -> (
+    String,
+    String,
+    Vec<PermissionOption>,
+    HashMap<String, ResolvedUserInputAnswer>,
+) {
+    let title = questions
+        .first()
+        .map(user_input_question_label)
+        .filter(|label| !label.is_empty())
+        .map(|label| format!("Ask user: {}", truncate_chars(&label, 80)))
+        .unwrap_or_else(|| "Ask user".to_string());
+    let multiple_questions = questions.len() > 1;
+    let mut content = Vec::new();
+    let mut options = Vec::new();
+    let mut option_map = HashMap::new();
+
+    for (question_index, question) in questions.iter().enumerate() {
+        let question_label = user_input_question_label(question);
+        if !question_label.is_empty() {
+            content.push(format!("Question {}: {question_label}", question_index + 1));
+        }
+        if !question.question.trim().is_empty()
+            && question.question.trim() != question_label.trim()
+        {
+            content.push(question.question.trim().to_string());
+        }
+
+        let mut has_fixed_options = false;
+        if let Some(question_options) = question.options.as_ref() {
+            for (option_index, option) in question_options.iter().enumerate() {
+                has_fixed_options = true;
+                let option_id = format!("answer:{question_index}:{option_index}");
+                let label = if multiple_questions {
+                    format!(
+                        "{}: {}",
+                        truncate_chars(&question_label, 28),
+                        option.label.trim()
+                    )
+                } else {
+                    option.label.trim().to_string()
+                };
+                let description = option.description.trim();
+                if description.is_empty() {
+                    content.push(format!("- {}", option.label.trim()));
+                } else {
+                    content.push(format!("- {}: {description}", option.label.trim()));
+                }
+                options.push(PermissionOption::new(
+                    option_id.clone(),
+                    label,
+                    PermissionOptionKind::AllowOnce,
+                ));
+                option_map.insert(
+                    option_id,
+                    ResolvedUserInputAnswer {
+                        question_id: question.id.clone(),
+                        answer: Some(option.label.clone()),
+                        use_guidance: false,
+                    },
+                );
+            }
+        }
+
+        if question.is_other || !has_fixed_options {
+            let option_id = format!("answer:{question_index}:custom");
+            let label = if multiple_questions {
+                format!("{}: Submit response", truncate_chars(&question_label, 28))
+            } else {
+                "Submit response".to_string()
+            };
+            content.push("- Custom response: use the supplemental note field.".to_string());
+            options.push(PermissionOption::new(
+                option_id.clone(),
+                label,
+                PermissionOptionKind::AllowOnce,
+            ));
+            option_map.insert(
+                option_id,
+                ResolvedUserInputAnswer {
+                    question_id: question.id.clone(),
+                    answer: None,
+                    use_guidance: true,
+                },
+            );
+        }
+
+        content.push(String::new());
+    }
+
+    if !options.is_empty() {
+        options.push(PermissionOption::new(
+            "cancel",
+            "Cancel",
+            PermissionOptionKind::RejectOnce,
+        ));
+    }
+
+    let content = content
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
+
+    (title, content, options, option_map)
+}
+
+fn user_input_question_label(question: &RequestUserInputQuestion) -> String {
+    let header = question.header.trim();
+    if !header.is_empty() {
+        return header.to_string();
+    }
+    question.question.trim().to_string()
 }
 
 fn build_exec_permission_options(
@@ -3294,13 +3607,40 @@ impl SessionClient {
             self.session_id.clone(),
             SessionUpdate::SessionInfoUpdate(SessionInfoUpdate::new()),
         )
-        .meta(Meta::from_iter([(
-            KODEX_CONTEXT_COMPACTED_META_KEY.to_owned(),
-            json!({}),
-        )]));
+        .meta(Meta::from_iter([
+            (
+                KODEX_CONTEXT_COMPACTION_META_KEY.to_owned(),
+                json!({
+                    "phase": "completed",
+                    "message": "上下文已自动压缩",
+                }),
+            ),
+            (KODEX_CONTEXT_COMPACTED_META_KEY.to_owned(), json!({})),
+        ]));
 
         if let Err(e) = self.client.send_session_notification(notification) {
             error!("Failed to send context compaction notification: {:?}", e);
+        }
+    }
+
+    fn send_context_compaction_started(&self) {
+        let notification = SessionNotification::new(
+            self.session_id.clone(),
+            SessionUpdate::SessionInfoUpdate(SessionInfoUpdate::new()),
+        )
+        .meta(Meta::from_iter([(
+            KODEX_CONTEXT_COMPACTION_META_KEY.to_owned(),
+            json!({
+                "phase": "started",
+                "message": "正在压缩上下文",
+            }),
+        )]));
+
+        if let Err(e) = self.client.send_session_notification(notification) {
+            error!(
+                "Failed to send context compaction start notification: {:?}",
+                e
+            );
         }
     }
 
@@ -3931,19 +4271,12 @@ impl<A: Auth> ThreadActor<A> {
         };
 
         self.thread
-            .submit(Op::OverrideTurnContext {
-                cwd: None,
-                approval_policy: None,
-                approvals_reviewer: None,
-                sandbox_policy: None,
-                permission_profile: None,
-                windows_sandbox_level: None,
-                model: Some(model_to_use.clone()),
-                effort: Some(effort_to_use),
-                summary: None,
-                service_tier: None,
-                collaboration_mode: None,
-                personality: None,
+            .submit(Op::ThreadSettings {
+                thread_settings: ThreadSettingsOverrides {
+                    model: Some(model_to_use.clone()),
+                    effort: Some(effort_to_use),
+                    ..Default::default()
+                },
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -3979,19 +4312,11 @@ impl<A: Auth> ThreadActor<A> {
         }
 
         self.thread
-            .submit(Op::OverrideTurnContext {
-                cwd: None,
-                approval_policy: None,
-                approvals_reviewer: None,
-                sandbox_policy: None,
-                permission_profile: None,
-                windows_sandbox_level: None,
-                model: None,
-                effort: Some(Some(effort)),
-                summary: None,
-                service_tier: None,
-                collaboration_mode: None,
-                personality: None,
+            .submit(Op::ThreadSettings {
+                thread_settings: ThreadSettingsOverrides {
+                    effort: Some(Some(effort)),
+                    ..Default::default()
+                },
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -4075,7 +4400,10 @@ impl<A: Auth> ThreadActor<A> {
         let op;
         if let Some((name, rest)) = extract_slash_command(&items) {
             match name {
-                "compact" => op = Op::Compact,
+                "compact" => {
+                    op = Op::Compact;
+                    self.client.send_context_compaction_started();
+                }
                 "init" => {
                     op = Op::UserInput {
                         items: vec![UserInput::Text {
@@ -4085,6 +4413,8 @@ impl<A: Auth> ThreadActor<A> {
                         final_output_json_schema: None,
                         environments: None,
                         responsesapi_client_metadata: None,
+                        additional_context: Default::default(),
+                        thread_settings: Default::default(),
                     }
                 }
                 "review" => {
@@ -4137,6 +4467,8 @@ impl<A: Auth> ThreadActor<A> {
                         final_output_json_schema: None,
                         environments: None,
                         responsesapi_client_metadata: None,
+                        additional_context: Default::default(),
+                        thread_settings: Default::default(),
                     }
                 }
             }
@@ -4146,6 +4478,8 @@ impl<A: Auth> ThreadActor<A> {
                 final_output_json_schema: None,
                 environments: None,
                 responsesapi_client_metadata: None,
+                additional_context: Default::default(),
+                thread_settings: Default::default(),
             }
         }
 
@@ -4191,6 +4525,8 @@ impl<A: Auth> ThreadActor<A> {
                 final_output_json_schema: None,
                 environments: None,
                 responsesapi_client_metadata: None,
+                additional_context: Default::default(),
+                thread_settings: Default::default(),
             })
             .await
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
@@ -4220,19 +4556,14 @@ impl<A: Auth> ThreadActor<A> {
             .ok_or_else(Error::invalid_params)?;
 
         self.thread
-            .submit(Op::OverrideTurnContext {
-                cwd: None,
-                approval_policy: Some(preset.approval),
-                approvals_reviewer: None,
-                sandbox_policy: None,
-                permission_profile: Some(preset.permission_profile.clone()),
-                windows_sandbox_level: None,
-                model: None,
-                effort: None,
-                summary: None,
-                service_tier: None,
-                collaboration_mode: None,
-                personality: None,
+            .submit(Op::ThreadSettings {
+                thread_settings: ThreadSettingsOverrides {
+                    approval_policy: Some(preset.approval),
+                    permission_profile: Some(preset.permission_profile.clone()),
+                    active_permission_profile: active_profile_id_for_session_mode(preset.id)
+                        .map(ActivePermissionProfile::new),
+                    ..Default::default()
+                },
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -4288,19 +4619,12 @@ impl<A: Auth> ThreadActor<A> {
         }
 
         self.thread
-            .submit(Op::OverrideTurnContext {
-                cwd: None,
-                approval_policy: None,
-                approvals_reviewer: None,
-                sandbox_policy: None,
-                permission_profile: None,
-                windows_sandbox_level: None,
-                model: Some(model_to_use.clone()),
-                effort: Some(effort_to_use),
-                summary: None,
-                service_tier: None,
-                collaboration_mode: None,
-                personality: None,
+            .submit(Op::ThreadSettings {
+                thread_settings: ThreadSettingsOverrides {
+                    model: Some(model_to_use.clone()),
+                    effort: Some(effort_to_use),
+                    ..Default::default()
+                },
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -4788,6 +5112,7 @@ fn build_prompt_items(prompt: Vec<ContentBlock>) -> Vec<UserInput> {
             }),
             ContentBlock::Image(image_block) => Some(UserInput::Image {
                 image_url: format!("data:{};base64,{}", image_block.mime_type, image_block.data),
+                detail: None,
             }),
             ContentBlock::ResourceLink(ResourceLink { name, uri, .. }) => Some(UserInput::Text {
                 text: format_uri_as_link(Some(name), uri),
@@ -5436,6 +5761,22 @@ mod tests {
                 .as_ref()
                 .is_some_and(|meta| meta.contains_key(KODEX_CONTEXT_COMPACTED_META_KEY))
         }));
+        assert!(notifications.iter().any(|notification| {
+            notification.meta.as_ref().is_some_and(|meta| {
+                meta.get(KODEX_CONTEXT_COMPACTION_META_KEY)
+                    .and_then(|value| value.get("phase"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("started")
+            })
+        }));
+        assert!(notifications.iter().any(|notification| {
+            notification.meta.as_ref().is_some_and(|meta| {
+                meta.get(KODEX_CONTEXT_COMPACTION_META_KEY)
+                    .and_then(|value| value.get("phase"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("completed")
+            })
+        }));
         let ops = thread.ops.lock().unwrap();
         assert_eq!(ops.as_slice(), &[Op::Compact]);
 
@@ -5570,6 +5911,8 @@ mod tests {
                 final_output_json_schema: None,
                 environments: None,
                 responsesapi_client_metadata: None,
+                additional_context: Default::default(),
+                thread_settings: Default::default(),
             }],
             "ops don't match {ops:?}"
         );
@@ -6316,6 +6659,7 @@ mod tests {
                                     model_context_window: None,
                                     collaboration_mode_kind: ModeKind::default(),
                                     turn_id: id.to_string(),
+                                    trace_id: None,
                                     started_at: None,
                                 }),
                             })
@@ -6400,6 +6744,7 @@ mod tests {
                     Op::ExecApproval { .. }
                     | Op::ResolveElicitation { .. }
                     | Op::RequestPermissionsResponse { .. }
+                    | Op::UserInputAnswer { .. }
                     | Op::PatchApproval { .. }
                     | Op::Interrupt => {}
                     Op::Shutdown => {
@@ -6917,6 +7262,303 @@ mod tests {
                         .and_then(|value| value.get("persist"))
                         .and_then(serde_json::Value::as_str),
                     Some(MCP_TOOL_APPROVAL_PERSIST_SESSION)
+                );
+            }
+            other => panic!("unexpected op: {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_request_user_input_routes_to_permission_request() -> anyhow::Result<()> {
+        let session_id = SessionId::new("test");
+        let client = Arc::new(StubClient::with_permission_responses(vec![
+            RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+                SelectedPermissionOutcome::new("answer:0:1"),
+            )),
+        ]));
+        let session_client =
+            SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
+        let thread = Arc::new(StubCodexThread::new());
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut prompt_state = PromptState::new(
+            "submission-id".to_string(),
+            session_id,
+            thread.clone(),
+            Arc::new(std::sync::Mutex::new(None)),
+            None,
+            None,
+            message_tx,
+            response_tx,
+        );
+
+        prompt_state
+            .handle_event(
+                &session_client,
+                EventMsg::RequestUserInput(RequestUserInputEvent {
+                    call_id: "call-user-input".to_string(),
+                    turn_id: "turn-id".to_string(),
+                    questions: vec![RequestUserInputQuestion {
+                        id: "approach".to_string(),
+                        header: "Approach".to_string(),
+                        question: "Which approach should I take?".to_string(),
+                        is_other: false,
+                        is_secret: false,
+                        options: Some(vec![
+                            codex_protocol::request_user_input::RequestUserInputQuestionOption {
+                                label: "First".to_string(),
+                                description: "Use the first path.".to_string(),
+                            },
+                            codex_protocol::request_user_input::RequestUserInputQuestionOption {
+                                label: "Second".to_string(),
+                                description: "Use the second path.".to_string(),
+                            },
+                        ]),
+                    }],
+                }),
+            )
+            .await;
+
+        let ThreadMessage::PermissionRequestResolved {
+            submission_id,
+            interaction_id,
+            request_key,
+            response,
+        } = message_rx.recv().await.unwrap()
+        else {
+            panic!("expected permission resolution message");
+        };
+        assert_eq!(submission_id, "submission-id");
+
+        {
+            let requests = client.permission_requests.lock().unwrap();
+            let request = requests.last().unwrap();
+            assert_eq!(request.tool_call.tool_call_id.0.as_ref(), "call-user-input");
+            assert_eq!(
+                request
+                    .options
+                    .iter()
+                    .map(|option| option.option_id.0.to_string())
+                    .collect::<Vec<_>>(),
+                vec!["answer:0:0", "answer:0:1", "cancel"]
+            );
+        }
+
+        prompt_state
+            .handle_permission_request_resolved(
+                &session_client,
+                interaction_id,
+                request_key,
+                response,
+            )
+            .await?;
+
+        let ops = thread.ops.lock().unwrap();
+        match ops.last() {
+            Some(Op::UserInputAnswer { id, response }) => {
+                assert_eq!(id, "turn-id");
+                assert_eq!(
+                    response.answers.get("approach").map(|answer| &answer.answers),
+                    Some(&vec!["Second".to_string()])
+                );
+            }
+            other => panic!("unexpected op: {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_request_user_input_custom_answer_uses_permission_guidance() -> anyhow::Result<()>
+    {
+        let session_id = SessionId::new("test");
+        let client = Arc::new(StubClient::with_permission_responses(vec![
+            RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+                SelectedPermissionOutcome::new("answer:0:custom"),
+            ))
+            .meta(Meta::from_iter([(
+                KODEX_PERMISSION_GUIDANCE_META_KEY.to_string(),
+                json!("Use the smaller scoped refactor."),
+            )])),
+        ]));
+        let session_client =
+            SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
+        let thread = Arc::new(StubCodexThread::new());
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut prompt_state = PromptState::new(
+            "submission-id".to_string(),
+            session_id,
+            thread.clone(),
+            Arc::new(std::sync::Mutex::new(None)),
+            None,
+            None,
+            message_tx,
+            response_tx,
+        );
+
+        prompt_state
+            .handle_event(
+                &session_client,
+                EventMsg::RequestUserInput(RequestUserInputEvent {
+                    call_id: "call-custom-input".to_string(),
+                    turn_id: "turn-id".to_string(),
+                    questions: vec![RequestUserInputQuestion {
+                        id: "guidance".to_string(),
+                        header: "Guidance".to_string(),
+                        question: "Tell Codex what to do differently.".to_string(),
+                        is_other: true,
+                        is_secret: false,
+                        options: None,
+                    }],
+                }),
+            )
+            .await;
+
+        let ThreadMessage::PermissionRequestResolved {
+            interaction_id,
+            request_key,
+            response,
+            ..
+        } = message_rx.recv().await.unwrap()
+        else {
+            panic!("expected permission resolution message");
+        };
+
+        prompt_state
+            .handle_permission_request_resolved(
+                &session_client,
+                interaction_id,
+                request_key,
+                response,
+            )
+            .await?;
+
+        let ops = thread.ops.lock().unwrap();
+        match ops.last() {
+            Some(Op::UserInputAnswer { response, .. }) => {
+                assert_eq!(
+                    response.answers.get("guidance").map(|answer| &answer.answers),
+                    Some(&vec!["Use the smaller scoped refactor.".to_string()])
+                );
+            }
+            other => panic!("unexpected op: {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_request_user_input_uses_structured_permission_answers() -> anyhow::Result<()> {
+        let session_id = SessionId::new("test");
+        let client = Arc::new(StubClient::with_permission_responses(vec![
+            RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+                SelectedPermissionOutcome::new("answer:0:0"),
+            ))
+            .meta(Meta::from_iter([(
+                KODEX_USER_INPUT_ANSWERS_META_KEY.to_string(),
+                json!({
+                    "answers": {
+                        "approach": ["Careful"],
+                        "checks": ["Unit", "Build"]
+                    }
+                }),
+            )])),
+        ]));
+        let session_client =
+            SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
+        let thread = Arc::new(StubCodexThread::new());
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut prompt_state = PromptState::new(
+            "submission-id".to_string(),
+            session_id,
+            thread.clone(),
+            Arc::new(std::sync::Mutex::new(None)),
+            None,
+            None,
+            message_tx,
+            response_tx,
+        );
+
+        prompt_state
+            .handle_event(
+                &session_client,
+                EventMsg::RequestUserInput(RequestUserInputEvent {
+                    call_id: "call-user-input".to_string(),
+                    turn_id: "turn-id".to_string(),
+                    questions: vec![
+                        RequestUserInputQuestion {
+                            id: "approach".to_string(),
+                            header: "Approach".to_string(),
+                            question: "Which approach should I take?".to_string(),
+                            is_other: false,
+                            is_secret: false,
+                            options: Some(vec![
+                                codex_protocol::request_user_input::RequestUserInputQuestionOption {
+                                    label: "Fast".to_string(),
+                                    description: "Use the fast path.".to_string(),
+                                },
+                                codex_protocol::request_user_input::RequestUserInputQuestionOption {
+                                    label: "Careful".to_string(),
+                                    description: "Use the careful path.".to_string(),
+                                },
+                            ]),
+                        },
+                        RequestUserInputQuestion {
+                            id: "checks".to_string(),
+                            header: "Checks".to_string(),
+                            question: "Which checks should run?".to_string(),
+                            is_other: true,
+                            is_secret: false,
+                            options: Some(vec![
+                                codex_protocol::request_user_input::RequestUserInputQuestionOption {
+                                    label: "Unit".to_string(),
+                                    description: "Run unit tests.".to_string(),
+                                },
+                                codex_protocol::request_user_input::RequestUserInputQuestionOption {
+                                    label: "Build".to_string(),
+                                    description: "Run build.".to_string(),
+                                },
+                            ]),
+                        },
+                    ],
+                }),
+            )
+            .await;
+
+        let ThreadMessage::PermissionRequestResolved {
+            interaction_id,
+            request_key,
+            response,
+            ..
+        } = message_rx.recv().await.unwrap()
+        else {
+            panic!("expected permission resolution message");
+        };
+
+        prompt_state
+            .handle_permission_request_resolved(
+                &session_client,
+                interaction_id,
+                request_key,
+                response,
+            )
+            .await?;
+
+        let ops = thread.ops.lock().unwrap();
+        match ops.last() {
+            Some(Op::UserInputAnswer { id, response }) => {
+                assert_eq!(id, "turn-id");
+                assert_eq!(
+                    response.answers.get("approach").map(|answer| &answer.answers),
+                    Some(&vec!["Careful".to_string()])
+                );
+                assert_eq!(
+                    response.answers.get("checks").map(|answer| &answer.answers),
+                    Some(&vec!["Unit".to_string(), "Build".to_string()])
                 );
             }
             other => panic!("unexpected op: {other:?}"),

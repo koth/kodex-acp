@@ -12,13 +12,14 @@ use acp::schema::{
 };
 use acp::{Agent, Client, ConnectTo, ConnectionTo, Error};
 use agent_client_protocol as acp;
-use codex_config::{McpServerConfig, McpServerTransportConfig};
+use codex_config::{DEFAULT_MCP_SERVER_ENVIRONMENT_ID, McpServerConfig, McpServerTransportConfig};
 use codex_core::{
     NewThread, RolloutRecorder, SortDirection, StateDbHandle, ThreadManager, ThreadSortKey,
     config::Config, find_thread_names_by_ids, find_thread_path_by_id_str, init_state_db,
     parse_cursor, resolve_installation_id, thread_store_from_config,
 };
 use codex_exec_server::{EnvironmentManager, ExecServerRuntimePaths};
+use codex_extension_api::empty_extension_registry;
 use codex_login::{
     CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR,
     auth::{AuthManager, CodexAuth, read_codex_api_key_from_env, read_openai_api_key_from_env},
@@ -58,6 +59,23 @@ pub struct CodexAgent {
 }
 
 const SESSION_LIST_PAGE_SIZE: usize = 25;
+const KODEX_FILE_EDITING_DEVELOPER_INSTRUCTIONS: &str = r#"Kodex file editing rule:
+- Do not directly create, overwrite, append, rename, move, or delete files through shell commands, Python/Node scripts, redirection, here-documents, tee, Set-Content, Remove-Item, mv/cp/rm, or similar filesystem-mutating shell commands.
+- Use the apply_patch tool/function for file edits. Shell commands are for read-only inspection or validation unless the user explicitly asks for a shell-based operation."#;
+
+fn merge_kodex_developer_instructions(existing: Option<String>) -> Option<String> {
+    match existing {
+        Some(instructions) if instructions.contains(KODEX_FILE_EDITING_DEVELOPER_INSTRUCTIONS) => {
+            Some(instructions)
+        }
+        Some(instructions) if !instructions.trim().is_empty() => Some(format!(
+            "{}\n\n{}",
+            instructions.trim_end(),
+            KODEX_FILE_EDITING_DEVELOPER_INSTRUCTIONS
+        )),
+        _ => Some(KODEX_FILE_EDITING_DEVELOPER_INSTRUCTIONS.to_string()),
+    }
+}
 
 impl CodexAgent {
     /// Create a new `CodexAgent` with the given configuration
@@ -79,7 +97,7 @@ impl CodexAgent {
         let local_runtime_paths =
             ExecServerRuntimePaths::new(std::env::current_exe()?, codex_linux_sandbox_exe)?;
         let environment_manager = Arc::new(
-            EnvironmentManager::from_codex_home(&config.codex_home, local_runtime_paths)
+            EnvironmentManager::from_codex_home(&config.codex_home, Some(local_runtime_paths))
                 .await
                 .map_err(std::io::Error::other)?,
         );
@@ -90,10 +108,12 @@ impl CodexAgent {
             auth_manager.clone(),
             SessionSource::Unknown,
             environment_manager,
+            empty_extension_registry(),
             None,
             thread_store,
             state_db.clone(),
             installation_id,
+            None,
         );
         Ok(Self {
             auth_manager,
@@ -342,6 +362,8 @@ impl CodexAgent {
     ) -> Result<Config, Error> {
         let mut config = self.config.clone();
         config.cwd = cwd.try_into().map_err(Error::into_internal_error)?;
+        config.developer_instructions =
+            merge_kodex_developer_instructions(config.developer_instructions);
         let cwd = config.cwd.clone();
 
         // Propagate any client-provided MCP servers that codex-rs supports.
@@ -368,6 +390,7 @@ impl CodexAgent {
                                 },
                                 env_http_headers: None,
                             },
+                            environment_id: DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
                             required: false,
                             enabled: true,
                             startup_timeout_sec: None,
@@ -376,9 +399,9 @@ impl CodexAgent {
                             enabled_tools: None,
                             disabled_reason: None,
                             scopes: None,
+                            oauth: None,
                             oauth_resource: None,
                             tools: Default::default(),
-                            experimental_environment: None,
                             supports_parallel_tool_calls: false,
                             default_tools_approval_mode: None,
                         },
@@ -407,6 +430,7 @@ impl CodexAgent {
                                 env_vars: vec![],
                                 cwd: Some(cwd.to_path_buf()),
                             },
+                            environment_id: DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
                             required: false,
                             enabled: true,
                             startup_timeout_sec: None,
@@ -415,9 +439,9 @@ impl CodexAgent {
                             enabled_tools: None,
                             disabled_reason: None,
                             scopes: None,
+                            oauth: None,
                             oauth_resource: None,
                             tools: Default::default(),
-                            experimental_environment: None,
                             supports_parallel_tool_calls: false,
                             default_tools_approval_mode: None,
                         },
@@ -942,7 +966,10 @@ fn distinct_session_title(title: &str, first_user_message: Option<&str>) -> Opti
 #[cfg(test)]
 mod tests {
     use super::InitializeResponse;
-    use super::{ProtocolVersion, build_agent_capabilities, distinct_session_title};
+    use super::{
+        KODEX_FILE_EDITING_DEVELOPER_INSTRUCTIONS, ProtocolVersion, build_agent_capabilities,
+        distinct_session_title, merge_kodex_developer_instructions,
+    };
 
     #[test]
     fn distinct_session_title_ignores_first_user_message() {
@@ -974,5 +1001,34 @@ mod tests {
             value.pointer("/agentCapabilities/sessionCapabilities/close"),
             Some(&serde_json::json!({}))
         );
+    }
+
+    #[test]
+    fn kodex_developer_instructions_are_added_when_missing() {
+        let merged = merge_kodex_developer_instructions(None).expect("instructions");
+
+        assert_eq!(merged, KODEX_FILE_EDITING_DEVELOPER_INSTRUCTIONS);
+    }
+
+    #[test]
+    fn kodex_developer_instructions_preserve_existing_text() {
+        let merged = merge_kodex_developer_instructions(Some("Existing rule.".to_string()))
+            .expect("instructions");
+
+        assert!(merged.starts_with("Existing rule.\n\n"));
+        assert!(merged.contains(KODEX_FILE_EDITING_DEVELOPER_INSTRUCTIONS));
+    }
+
+    #[test]
+    fn kodex_developer_instructions_are_not_duplicated() {
+        let existing = format!(
+            "Existing rule.\n\n{}",
+            KODEX_FILE_EDITING_DEVELOPER_INSTRUCTIONS
+        );
+
+        let merged =
+            merge_kodex_developer_instructions(Some(existing.clone())).expect("instructions");
+
+        assert_eq!(merged, existing);
     }
 }
