@@ -1241,7 +1241,8 @@ struct PromptState {
     next_permission_interaction_id: u64,
     event_count: usize,
     response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
-    seen_message_deltas: bool,
+    seen_final_message_deltas: bool,
+    seen_commentary_message_deltas: bool,
     seen_reasoning_deltas: bool,
     agent_message_text: String,
     commentary_message_item_ids: HashSet<String>,
@@ -1274,7 +1275,8 @@ impl PromptState {
             next_permission_interaction_id: 0,
             event_count: 0,
             response_tx: Some(response_tx),
-            seen_message_deltas: false,
+            seen_final_message_deltas: false,
+            seen_commentary_message_deltas: false,
             seen_reasoning_deltas: false,
             agent_message_text: String::new(),
             commentary_message_item_ids: HashSet::new(),
@@ -1832,10 +1834,11 @@ impl PromptState {
             }) => {
                 info!("Agent message content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, delta: {delta:?}");
                 if self.commentary_message_item_ids.contains(&item_id) {
-                    return;
+                    self.seen_commentary_message_deltas = true;
+                } else {
+                    self.seen_final_message_deltas = true;
+                    self.agent_message_text.push_str(&delta);
                 }
-                self.seen_message_deltas = true;
-                self.agent_message_text.push_str(&delta);
                 client.send_agent_text(delta);
             }
             EventMsg::ReasoningContentDelta(ReasoningContentDeltaEvent {
@@ -1875,12 +1878,15 @@ impl PromptState {
                 ..
             }) => {
                 info!("Agent message (non-delta) received: {message:?}");
-                if is_commentary_phase(phase.as_ref()) {
-                    return;
-                }
+                let is_commentary = is_commentary_phase(phase.as_ref());
+                let saw_delta = if is_commentary {
+                    &mut self.seen_commentary_message_deltas
+                } else {
+                    &mut self.seen_final_message_deltas
+                };
                 // We didn't receive this message via streaming
-                if !std::mem::take(&mut self.seen_message_deltas) {
-                    if self.agent_message_text.is_empty() {
+                if !std::mem::take(saw_delta) {
+                    if !is_commentary && self.agent_message_text.is_empty() {
                         self.agent_message_text.push_str(&message);
                     }
                     client.send_agent_text(message);
@@ -3120,8 +3126,7 @@ impl PromptState {
         } else {
             turn_id
         };
-        let (title, content, options, option_map) =
-            build_user_input_permission_request(&questions);
+        let (title, content, options, option_map) = build_user_input_permission_request(&questions);
         let content = if content.is_empty() {
             None
         } else {
@@ -3244,8 +3249,7 @@ fn build_user_input_permission_request(
         if !question_label.is_empty() {
             content.push(format!("Question {}: {question_label}", question_index + 1));
         }
-        if !question.question.trim().is_empty()
-            && question.question.trim() != question_label.trim()
+        if !question.question.trim().is_empty() && question.question.trim() != question_label.trim()
         {
             content.push(question.question.trim().to_string());
         }
@@ -5559,7 +5563,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commentary_phase_agent_message_is_not_sent_as_chat() -> anyhow::Result<()> {
+    async fn commentary_phase_agent_message_is_sent_as_chat() -> anyhow::Result<()> {
         let (session_id, client, _, message_tx, _handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
@@ -5573,7 +5577,7 @@ mod tests {
         drop(message_tx);
 
         let notifications = client.notifications.lock().unwrap();
-        assert!(!notifications.iter().any(|notification| {
+        assert!(notifications.iter().any(|notification| {
             matches!(
                 &notification.update,
                 SessionUpdate::AgentMessageChunk(ContentChunk {
@@ -5604,7 +5608,7 @@ mod tests {
         drop(message_tx);
 
         let notifications = client.notifications.lock().unwrap();
-        assert!(!notifications.iter().any(|notification| {
+        assert!(notifications.iter().any(|notification| {
             matches!(
                 &notification.update,
                 SessionUpdate::AgentMessageChunk(ContentChunk {
@@ -7360,7 +7364,10 @@ mod tests {
             Some(Op::UserInputAnswer { id, response }) => {
                 assert_eq!(id, "turn-id");
                 assert_eq!(
-                    response.answers.get("approach").map(|answer| &answer.answers),
+                    response
+                        .answers
+                        .get("approach")
+                        .map(|answer| &answer.answers),
                     Some(&vec!["Second".to_string()])
                 );
             }
@@ -7440,7 +7447,10 @@ mod tests {
         match ops.last() {
             Some(Op::UserInputAnswer { response, .. }) => {
                 assert_eq!(
-                    response.answers.get("guidance").map(|answer| &answer.answers),
+                    response
+                        .answers
+                        .get("guidance")
+                        .map(|answer| &answer.answers),
                     Some(&vec!["Use the smaller scoped refactor.".to_string()])
                 );
             }
@@ -7553,7 +7563,10 @@ mod tests {
             Some(Op::UserInputAnswer { id, response }) => {
                 assert_eq!(id, "turn-id");
                 assert_eq!(
-                    response.answers.get("approach").map(|answer| &answer.answers),
+                    response
+                        .answers
+                        .get("approach")
+                        .map(|answer| &answer.answers),
                     Some(&vec!["Careful".to_string()])
                 );
                 assert_eq!(

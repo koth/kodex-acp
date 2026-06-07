@@ -20,6 +20,7 @@ use codex_core::{
 };
 use codex_exec_server::{EnvironmentManager, ExecServerRuntimePaths};
 use codex_extension_api::empty_extension_registry;
+use codex_features::Feature;
 use codex_login::{
     CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR,
     auth::{AuthManager, CodexAuth, read_codex_api_key_from_env, read_openai_api_key_from_env},
@@ -364,6 +365,10 @@ impl CodexAgent {
         config.cwd = cwd.try_into().map_err(Error::into_internal_error)?;
         config.developer_instructions =
             merge_kodex_developer_instructions(config.developer_instructions);
+        config
+            .features
+            .enable(Feature::DefaultModeRequestUserInput)
+            .map_err(Error::into_internal_error)?;
         let cwd = config.cwd.clone();
 
         // Propagate any client-provided MCP servers that codex-rs supports.
