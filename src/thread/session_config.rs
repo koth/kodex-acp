@@ -16,8 +16,7 @@ pub(super) const KODEX_PERMISSION_GUIDANCE_META_KEY: &str = "kodex.ai/permission
 pub(super) const KODEX_USER_INPUT_ANSWERS_META_KEY: &str = "kodex.ai/userInputAnswers";
 pub(super) const KODEX_MODEL_PROVIDER_MAP_ENV: &str = "KODEX_MODEL_PROVIDER_MAP";
 pub(super) const KODEX_PROVIDER_VALUE_PREFIX: &str = "kodex-provider:";
-pub(super) const SESSION_TITLE_INSTRUCTIONS: &str =
-    r#"Generate a concise title for this coding session.
+pub(super) const SESSION_TITLE_INSTRUCTIONS: &str = r#"Generate a concise title for this coding session.
 
 Rules:
 - Return only the title text.

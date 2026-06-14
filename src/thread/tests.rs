@@ -1,4 +1,3 @@
-use super::*;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,8 +11,14 @@ use codex_protocol::items::AgentMessageItem;
 use codex_protocol::{ThreadId, protocol::ThreadGoal};
 use tokio::sync::{Mutex, Notify, mpsc::UnboundedSender};
 
+use super::event_mapping::guardian_action_summary;
+use super::permissions::{
+    MCP_TOOL_APPROVAL_ALLOW_ALWAYS_OPTION_ID, MCP_TOOL_APPROVAL_ALLOW_OPTION_ID,
+    MCP_TOOL_APPROVAL_ALLOW_SESSION_OPTION_ID, MCP_TOOL_APPROVAL_CANCEL_OPTION_ID,
+    MCP_TOOL_APPROVAL_PERSIST_SESSION, MCP_TOOL_APPROVAL_REQUEST_ID_PREFIX,
+};
+use super::title::ThreadTitleState;
 use super::*;
-
 
 mod basic;
 mod permissions;
@@ -48,11 +53,9 @@ async fn setup_with_title_generator(
         SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
     let conversation = Arc::new(StubCodexThread::new());
     let models_manager = Arc::new(StubModelsManager);
-    let config = Config::load_with_cli_overrides_and_harness_overrides(
-        vec![],
-        ConfigOverrides::default(),
-    )
-    .await?;
+    let config =
+        Config::load_with_cli_overrides_and_harness_overrides(vec![], ConfigOverrides::default())
+            .await?;
     let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
     let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -633,15 +636,13 @@ impl CodexThreadImpl for StubCodexThread {
                 | Op::PatchApproval { .. }
                 | Op::Interrupt => {}
                 Op::Shutdown => {
-                    if let Some(active_prompt_id) = self.active_prompt_id.lock().unwrap().take()
-                    {
+                    if let Some(active_prompt_id) = self.active_prompt_id.lock().unwrap().take() {
                         self.op_tx
                             .send(Event {
                                 id: active_prompt_id.clone(),
                                 msg: EventMsg::TurnAborted(TurnAbortedEvent {
                                     turn_id: Some(active_prompt_id),
-                                    reason:
-                                        codex_protocol::protocol::TurnAbortReason::Interrupted,
+                                    reason: codex_protocol::protocol::TurnAbortReason::Interrupted,
                                     completed_at: None,
                                     duration_ms: None,
                                 }),
@@ -736,8 +737,7 @@ impl ClientSender for StubClient {
     fn request_permission(
         &self,
         args: RequestPermissionRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<RequestPermissionResponse, Error>> + Send + '_>>
-    {
+    ) -> Pin<Box<dyn Future<Output = Result<RequestPermissionResponse, Error>> + Send + '_>> {
         Box::pin(async move {
             self.permission_requests.lock().unwrap().push(args);
             if let Some(notify) = &self.block_permission_requests {
@@ -825,4 +825,3 @@ async fn test_parallel_exec_commands() -> anyhow::Result<()> {
 
     Ok(())
 }
-

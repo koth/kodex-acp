@@ -158,7 +158,9 @@ pub(super) fn guardian_assessment_tool_call_id(id: &str) -> String {
     format!("guardian_assessment:{id}")
 }
 
-pub(super) fn guardian_assessment_tool_call_status(status: &GuardianAssessmentStatus) -> ToolCallStatus {
+pub(super) fn guardian_assessment_tool_call_status(
+    status: &GuardianAssessmentStatus,
+) -> ToolCallStatus {
     match status {
         GuardianAssessmentStatus::InProgress => ToolCallStatus::InProgress,
         GuardianAssessmentStatus::Approved => ToolCallStatus::Completed,

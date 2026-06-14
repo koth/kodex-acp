@@ -247,7 +247,6 @@ pub async fn generate_session_title_with_model(
         .await
 }
 
-
 pub(super) fn publish_session_title(
     session_title: &Arc<Mutex<Option<String>>>,
     client: &SessionClient,

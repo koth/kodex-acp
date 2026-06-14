@@ -144,9 +144,7 @@ async fn test_image_generation_emits_image_content() -> anyhow::Result<()> {
     let tool_call = notifications
         .iter()
         .find_map(|notification| match &notification.update {
-            SessionUpdate::ToolCall(tool_call)
-                if tool_call.tool_call_id.0.as_ref() == "ig-1" =>
-            {
+            SessionUpdate::ToolCall(tool_call) if tool_call.tool_call_id.0.as_ref() == "ig-1" => {
                 Some(tool_call)
             }
             _ => None,
@@ -158,9 +156,7 @@ async fn test_image_generation_emits_image_content() -> anyhow::Result<()> {
     let update = notifications
         .iter()
         .find_map(|notification| match &notification.update {
-            SessionUpdate::ToolCallUpdate(update)
-                if update.tool_call_id.0.as_ref() == "ig-1" =>
-            {
+            SessionUpdate::ToolCallUpdate(update) if update.tool_call_id.0.as_ref() == "ig-1" => {
                 Some(update)
             }
             _ => None,
@@ -267,11 +263,9 @@ fn test_guardian_execve_summary_uses_argv_without_duplication() -> anyhow::Resul
 
 #[tokio::test]
 async fn modes_match_augmented_workspace_permission_profile() -> anyhow::Result<()> {
-    let mut config = Config::load_with_cli_overrides_and_harness_overrides(
-        vec![],
-        ConfigOverrides::default(),
-    )
-    .await?;
+    let mut config =
+        Config::load_with_cli_overrides_and_harness_overrides(vec![], ConfigOverrides::default())
+            .await?;
     config
         .permissions
         .approval_policy
@@ -300,11 +294,9 @@ async fn modes_match_augmented_workspace_permission_profile() -> anyhow::Result<
 
 #[tokio::test]
 async fn modes_match_legacy_augmented_workspace_permission_profile() -> anyhow::Result<()> {
-    let mut config = Config::load_with_cli_overrides_and_harness_overrides(
-        vec![],
-        ConfigOverrides::default(),
-    )
-    .await?;
+    let mut config =
+        Config::load_with_cli_overrides_and_harness_overrides(vec![], ConfigOverrides::default())
+            .await?;
     config
         .permissions
         .approval_policy
@@ -602,4 +594,3 @@ async fn test_delta_deduplication() -> anyhow::Result<()> {
 
     Ok(())
 }
-

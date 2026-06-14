@@ -1,4 +1,3 @@
-use super::*;
 use super::InitializeResponse;
 use super::{
     KODEX_FILE_EDITING_DEVELOPER_INSTRUCTIONS, ProtocolVersion, build_agent_capabilities,
@@ -23,8 +22,8 @@ fn distinct_session_title_keeps_saved_title() {
 
 #[test]
 fn initialize_response_advertises_session_list_capability() {
-    let response = InitializeResponse::new(ProtocolVersion::V1)
-        .agent_capabilities(build_agent_capabilities());
+    let response =
+        InitializeResponse::new(ProtocolVersion::V1).agent_capabilities(build_agent_capabilities());
     let value = serde_json::to_value(response).expect("serialize initialize response");
 
     assert_eq!(
@@ -60,8 +59,7 @@ fn kodex_developer_instructions_are_not_duplicated() {
         KODEX_FILE_EDITING_DEVELOPER_INSTRUCTIONS
     );
 
-    let merged =
-        merge_kodex_developer_instructions(Some(existing.clone())).expect("instructions");
+    let merged = merge_kodex_developer_instructions(Some(existing.clone())).expect("instructions");
 
     assert_eq!(merged, existing);
 }

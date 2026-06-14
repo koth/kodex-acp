@@ -96,7 +96,7 @@ pub(super) fn user_input_request_key(id: &str, call_id: &str) -> String {
 const MCP_TOOL_APPROVAL_KIND_KEY: &str = "codex_approval_kind";
 const MCP_TOOL_APPROVAL_KIND_MCP_TOOL_CALL: &str = "mcp_tool_call";
 const MCP_TOOL_APPROVAL_PERSIST_KEY: &str = "persist";
-const MCP_TOOL_APPROVAL_PERSIST_SESSION: &str = "session";
+pub(in crate::thread) const MCP_TOOL_APPROVAL_PERSIST_SESSION: &str = "session";
 const MCP_TOOL_APPROVAL_PERSIST_ALWAYS: &str = "always";
 const MCP_TOOL_APPROVAL_TOOL_TITLE_KEY: &str = "tool_title";
 const MCP_TOOL_APPROVAL_TOOL_DESCRIPTION_KEY: &str = "tool_description";
@@ -104,11 +104,12 @@ const MCP_TOOL_APPROVAL_CONNECTOR_NAME_KEY: &str = "connector_name";
 const MCP_TOOL_APPROVAL_CONNECTOR_DESCRIPTION_KEY: &str = "connector_description";
 const MCP_TOOL_APPROVAL_TOOL_PARAMS_KEY: &str = "tool_params";
 const MCP_TOOL_APPROVAL_TOOL_PARAMS_DISPLAY_KEY: &str = "tool_params_display";
-const MCP_TOOL_APPROVAL_REQUEST_ID_PREFIX: &str = "mcp_tool_call_approval_";
-const MCP_TOOL_APPROVAL_ALLOW_OPTION_ID: &str = "approved";
-const MCP_TOOL_APPROVAL_ALLOW_SESSION_OPTION_ID: &str = "approved-for-session";
-const MCP_TOOL_APPROVAL_ALLOW_ALWAYS_OPTION_ID: &str = "approved-always";
-const MCP_TOOL_APPROVAL_CANCEL_OPTION_ID: &str = "cancel";
+pub(in crate::thread) const MCP_TOOL_APPROVAL_REQUEST_ID_PREFIX: &str = "mcp_tool_call_approval_";
+pub(in crate::thread) const MCP_TOOL_APPROVAL_ALLOW_OPTION_ID: &str = "approved";
+pub(in crate::thread) const MCP_TOOL_APPROVAL_ALLOW_SESSION_OPTION_ID: &str =
+    "approved-for-session";
+pub(in crate::thread) const MCP_TOOL_APPROVAL_ALLOW_ALWAYS_OPTION_ID: &str = "approved-always";
+pub(in crate::thread) const MCP_TOOL_APPROVAL_CANCEL_OPTION_ID: &str = "cancel";
 
 pub(super) struct SupportedMcpElicitationPermissionRequest {
     pub(super) request_key: String,
@@ -336,7 +337,9 @@ pub(super) fn format_thread_goal_update(event: &ThreadGoalUpdatedEvent) -> Strin
     }
 }
 
-pub(super) fn permission_guidance_from_response(response: &RequestPermissionResponse) -> Option<String> {
+pub(super) fn permission_guidance_from_response(
+    response: &RequestPermissionResponse,
+) -> Option<String> {
     response
         .meta
         .as_ref()
@@ -440,7 +443,6 @@ pub(super) fn permission_guidance_followup(
         None
     }
 }
-
 
 #[derive(Clone)]
 pub(super) struct ExecPermissionOption {
@@ -690,7 +692,10 @@ pub(super) struct ParseCommandToolCall {
     pub(super) kind: ToolKind,
 }
 
-pub(super) fn parse_command_tool_call(parsed_cmd: Vec<ParsedCommand>, cwd: &Path) -> ParseCommandToolCall {
+pub(super) fn parse_command_tool_call(
+    parsed_cmd: Vec<ParsedCommand>,
+    cwd: &Path,
+) -> ParseCommandToolCall {
     let mut titles = Vec::new();
     let mut locations = Vec::new();
     let mut file_extension = None;

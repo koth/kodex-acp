@@ -56,12 +56,7 @@ async fn test_exec_approval_uses_available_decisions() -> anyhow::Result<()> {
     };
     assert_eq!(submission_id, "submission-id");
     prompt_state
-        .handle_permission_request_resolved(
-            &session_client,
-            interaction_id,
-            request_key,
-            response,
-        )
+        .handle_permission_request_resolved(&session_client, interaction_id, request_key, response)
         .await?;
 
     let requests = client.permission_requests.lock().unwrap();
@@ -87,8 +82,7 @@ async fn test_exec_approval_uses_available_decisions() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn test_mcp_tool_approval_elicitation_routes_to_permission_request() -> anyhow::Result<()>
-{
+async fn test_mcp_tool_approval_elicitation_routes_to_permission_request() -> anyhow::Result<()> {
     let session_id = SessionId::new("test");
     let client = Arc::new(StubClient::with_permission_responses(vec![
         RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
@@ -175,12 +169,7 @@ async fn test_mcp_tool_approval_elicitation_routes_to_permission_request() -> an
     }
 
     prompt_state
-        .handle_permission_request_resolved(
-            &session_client,
-            interaction_id,
-            request_key,
-            response,
-        )
+        .handle_permission_request_resolved(&session_client, interaction_id, request_key, response)
         .await?;
 
     let op = thread.ops.lock().unwrap().last().cloned().unwrap();
@@ -286,12 +275,7 @@ async fn test_request_user_input_routes_to_permission_request() -> anyhow::Resul
     }
 
     prompt_state
-        .handle_permission_request_resolved(
-            &session_client,
-            interaction_id,
-            request_key,
-            response,
-        )
+        .handle_permission_request_resolved(&session_client, interaction_id, request_key, response)
         .await?;
 
     let ops = thread.ops.lock().unwrap();
@@ -313,8 +297,7 @@ async fn test_request_user_input_routes_to_permission_request() -> anyhow::Resul
 }
 
 #[tokio::test]
-async fn test_request_user_input_custom_answer_uses_permission_guidance() -> anyhow::Result<()>
-{
+async fn test_request_user_input_custom_answer_uses_permission_guidance() -> anyhow::Result<()> {
     let session_id = SessionId::new("test");
     let client = Arc::new(StubClient::with_permission_responses(vec![
         RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
@@ -370,12 +353,7 @@ async fn test_request_user_input_custom_answer_uses_permission_guidance() -> any
     };
 
     prompt_state
-        .handle_permission_request_resolved(
-            &session_client,
-            interaction_id,
-            request_key,
-            response,
-        )
+        .handle_permission_request_resolved(&session_client, interaction_id, request_key, response)
         .await?;
 
     let ops = thread.ops.lock().unwrap();
@@ -485,12 +463,7 @@ async fn test_request_user_input_uses_structured_permission_answers() -> anyhow:
     };
 
     prompt_state
-        .handle_permission_request_resolved(
-            &session_client,
-            interaction_id,
-            request_key,
-            response,
-        )
+        .handle_permission_request_resolved(&session_client, interaction_id, request_key, response)
         .await?;
 
     let ops = thread.ops.lock().unwrap();
@@ -620,10 +593,7 @@ async fn test_blocked_approval_does_not_block_followup_events() -> anyhow::Resul
                 proposed_execpolicy_amendment: None,
                 proposed_network_policy_amendments: None,
                 additional_permissions: None,
-                available_decisions: Some(vec![
-                    ReviewDecision::Approved,
-                    ReviewDecision::Abort,
-                ]),
+                available_decisions: Some(vec![ReviewDecision::Approved, ReviewDecision::Abort]),
                 parsed_cmd: vec![ParsedCommand::Unknown {
                     cmd: "echo hi".to_string(),
                 }],
@@ -701,10 +671,7 @@ async fn test_detached_permission_request_drains_late_response() -> anyhow::Resu
                 proposed_execpolicy_amendment: None,
                 proposed_network_policy_amendments: None,
                 additional_permissions: None,
-                available_decisions: Some(vec![
-                    ReviewDecision::Approved,
-                    ReviewDecision::Abort,
-                ]),
+                available_decisions: Some(vec![ReviewDecision::Approved, ReviewDecision::Abort]),
                 parsed_cmd: vec![ParsedCommand::Unknown {
                     cmd: "echo hi".to_string(),
                 }],
@@ -739,12 +706,7 @@ async fn test_detached_permission_request_drains_late_response() -> anyhow::Resu
     assert_eq!(submission_id, "submission-id");
 
     prompt_state
-        .handle_permission_request_resolved(
-            &session_client,
-            interaction_id,
-            request_key,
-            response,
-        )
+        .handle_permission_request_resolved(&session_client, interaction_id, request_key, response)
         .await?;
 
     let ops = thread.ops.lock().unwrap();
@@ -772,11 +734,9 @@ async fn permission_abort_guidance_submits_followup_prompt() -> anyhow::Result<(
         SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
     let conversation = Arc::new(StubCodexThread::new());
     let models_manager = Arc::new(StubModelsManager);
-    let config = Config::load_with_cli_overrides_and_harness_overrides(
-        vec![],
-        ConfigOverrides::default(),
-    )
-    .await?;
+    let config =
+        Config::load_with_cli_overrides_and_harness_overrides(vec![], ConfigOverrides::default())
+            .await?;
     let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
     let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
     let actor = ThreadActor::new(
@@ -848,11 +808,9 @@ async fn test_thread_shutdown_bypasses_blocked_permission_request() -> anyhow::R
         SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
     let conversation = Arc::new(StubCodexThread::new());
     let models_manager = Arc::new(StubModelsManager);
-    let config = Config::load_with_cli_overrides_and_harness_overrides(
-        vec![],
-        ConfigOverrides::default(),
-    )
-    .await?;
+    let config =
+        Config::load_with_cli_overrides_and_harness_overrides(vec![], ConfigOverrides::default())
+            .await?;
     let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
     let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
     let actor = ThreadActor::new(
@@ -892,8 +850,7 @@ async fn test_thread_shutdown_bypasses_blocked_permission_request() -> anyhow::R
     .await?;
 
     tokio::time::timeout(Duration::from_millis(100), thread.shutdown()).await??;
-    let stop_reason =
-        tokio::time::timeout(Duration::from_millis(100), stop_reason_rx).await??;
+    let stop_reason = tokio::time::timeout(Duration::from_millis(100), stop_reason_rx).await??;
     assert_eq!(stop_reason?, StopReason::Cancelled);
     notify.notify_one();
 

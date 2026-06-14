@@ -131,7 +131,7 @@ impl PromptState {
         !response_tx.is_closed()
     }
 
-    fn detach_pending_interactions(&mut self) {
+    pub(in crate::thread) fn detach_pending_interactions(&mut self) {
         // Keep detached permission request tasks running so ACP can route the
         // client's required `Cancelled` response after session cancellation.
         self.pending_permission_interactions.clear();
@@ -172,7 +172,7 @@ impl PromptState {
         );
     }
 
-    async fn handle_permission_request_resolved(
+    pub(in crate::thread) async fn handle_permission_request_resolved(
         &mut self,
         _client: &SessionClient,
         interaction_id: u64,
@@ -344,7 +344,11 @@ impl PromptState {
     }
 
     #[expect(clippy::too_many_lines)]
-    async fn handle_event(&mut self, client: &SessionClient, event: EventMsg) {
+    pub(in crate::thread) async fn handle_event(
+        &mut self,
+        client: &SessionClient,
+        event: EventMsg,
+    ) {
         self.event_count += 1;
 
         // Complete any previous web search before starting a new one
@@ -849,5 +853,4 @@ impl PromptState {
             }
         }
     }
-
 }

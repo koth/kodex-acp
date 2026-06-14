@@ -40,8 +40,7 @@ async fn first_turn_persists_and_publishes_llm_session_title() -> anyhow::Result
 }
 
 #[tokio::test]
-async fn first_turn_falls_back_to_hidden_thread_title_when_generator_fails()
--> anyhow::Result<()> {
+async fn first_turn_falls_back_to_hidden_thread_title_when_generator_fails() -> anyhow::Result<()> {
     let title_generator = Arc::new(FailingSessionTitleGenerator::new());
     let title_generator_trait: Arc<dyn SessionTitleGenerator> = title_generator.clone();
     let (session_id, client, thread, message_tx, _handle) =
@@ -119,4 +118,3 @@ async fn first_turn_does_not_use_agent_reply_as_session_title() -> anyhow::Resul
 
     Ok(())
 }
-

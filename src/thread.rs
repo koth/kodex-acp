@@ -107,20 +107,19 @@ mod title;
 use actor::ThreadActor;
 use event_mapping::{
     build_prompt_items, extract_slash_command, extract_tool_call_content_from_changes,
-    format_file_system_entries, format_uri_as_link, generate_fallback_id,
-    guardian_action_summary, guardian_assessment_content, guardian_assessment_tool_call_id,
-    guardian_assessment_tool_call_status, image_generation_content, image_generation_tool_status,
-    is_commentary_phase, web_search_action_to_title_and_id,
+    format_file_system_entries, generate_fallback_id, guardian_assessment_content,
+    guardian_assessment_tool_call_id, guardian_assessment_tool_call_status,
+    image_generation_content, image_generation_tool_status, is_commentary_phase,
+    web_search_action_to_title_and_id,
 };
 use permissions::{
-    ExecPermissionOption, ParseCommandToolCall, PendingPermissionInteraction,
-    PendingPermissionRequest, ResolvedMcpElicitation, SupportedMcpElicitationPermissionRequest,
-    build_exec_permission_options, build_supported_mcp_elicitation_permission_request,
-    build_user_input_permission_request, empty_user_input_response, exec_request_key,
-    format_thread_goal_update, mcp_elicitation_request_key, parse_command_tool_call,
-    patch_request_key, permission_guidance_followup, permission_guidance_from_response,
-    permissions_request_key, user_input_request_key, user_input_response_from_answer,
-    user_input_response_from_permission_response,
+    ParseCommandToolCall, PendingPermissionInteraction, PendingPermissionRequest,
+    ResolvedMcpElicitation, build_exec_permission_options,
+    build_supported_mcp_elicitation_permission_request, build_user_input_permission_request,
+    empty_user_input_response, exec_request_key, format_thread_goal_update,
+    parse_command_tool_call, patch_request_key, permission_guidance_followup,
+    permission_guidance_from_response, permissions_request_key, user_input_request_key,
+    user_input_response_from_answer, user_input_response_from_permission_response,
 };
 use prompt_state::{ActiveCommand, PromptState, SubmissionState};
 use session_config::{
@@ -129,14 +128,14 @@ use session_config::{
     KODEX_PERMISSION_GUIDANCE_META_KEY, KODEX_PROVIDER_VALUE_PREFIX,
     KODEX_USER_INPUT_ANSWERS_META_KEY, KodexModelProviderEntry, SESSION_TITLE_GENERATION_TIMEOUT,
     SESSION_TITLE_INSTRUCTIONS, SESSION_TITLE_MAX_CHARS, SESSION_TITLE_PROMPT_MAX_CHARS,
-    SESSION_TITLE_ROLLBACK_TIMEOUT,
-    active_profile_id_for_session_mode, current_session_mode_id, mode_trusts_project,
+    SESSION_TITLE_ROLLBACK_TIMEOUT, active_profile_id_for_session_mode, current_session_mode_id,
+    mode_trusts_project,
 };
 pub use title::generate_session_title_with_model;
 use title::{
     CodexThreadImpl, ModelSessionTitleGenerator, ModelsManagerImpl, SessionTitleGenerator,
-    ThreadTitleState, build_session_title_prompt, non_empty_str, normalize_session_title,
-    prompt_text_from_items, publish_session_title, truncate_chars,
+    build_session_title_prompt, non_empty_str, normalize_session_title, prompt_text_from_items,
+    publish_session_title, truncate_chars,
 };
 
 /// Abstraction over the ACP connection for sending notifications and requests
