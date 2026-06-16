@@ -44,6 +44,9 @@ allocative = "=0.3.4"
 diffy = { version = "0.5.0", features = ["std"] }
 futures = "0.3"
 itertools = "0.14.0"
+# Force native-tls/reqwest transitive OpenSSL users onto the vendored static
+# build so remote Linux agents do not depend on the host libssl ABI.
+openssl = { version = "0.10", features = ["vendored"] }
 serde = { version = "1", features = ["derive"] }
 # codex-cli depends on codex-tui, which enables serde_json/preserve_order; match
 # that behavior here because it affects MCP keychain account hashing.
