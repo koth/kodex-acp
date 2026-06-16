@@ -44,9 +44,6 @@ allocative = "=0.3.4"
 diffy = { version = "0.5.0", features = ["std"] }
 futures = "0.3"
 itertools = "0.14.0"
-# Force native-tls/reqwest transitive OpenSSL users onto the vendored static
-# build so remote Linux agents do not depend on the host libssl ABI.
-openssl = { version = "0.10", features = ["vendored"] }
 serde = { version = "1", features = ["derive"] }
 # codex-cli depends on codex-tui, which enables serde_json/preserve_order; match
 # that behavior here because it affects MCP keychain account hashing.
@@ -58,6 +55,11 @@ tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 heck = "0.5.0"
 uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Force native-tls/reqwest transitive OpenSSL users onto the vendored static
+# build so remote Linux agents do not depend on the host libssl ABI.
+openssl = { version = "0.10", features = ["vendored"] }
 
 [lints.rust]
 let-underscore = "warn"
