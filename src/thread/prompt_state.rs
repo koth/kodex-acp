@@ -50,6 +50,12 @@ impl SubmissionState {
         }
     }
 
+    pub(super) fn stop_tool(&mut self, client: &SessionClient, tool_call_id: &str) -> bool {
+        match self {
+            Self::Prompt(state) => state.stop_tool(client, tool_call_id),
+        }
+    }
+
     pub(super) fn fail(&mut self, err: Error) {
         if let Self::Prompt(state) = self
             && let Some(response_tx) = state.response_tx.take()
@@ -70,6 +76,8 @@ pub(super) struct PromptState {
     submission_id: String,
     session_id: SessionId,
     active_commands: HashMap<String, ActiveCommand>,
+    active_agent_owned_tools: HashSet<String>,
+    stopped_agent_owned_tools: HashSet<String>,
     active_web_search: Option<String>,
     active_image_generations: HashSet<String>,
     active_guardian_assessments: HashSet<String>,
@@ -104,6 +112,8 @@ impl PromptState {
             submission_id,
             session_id,
             active_commands: HashMap::new(),
+            active_agent_owned_tools: HashSet::new(),
+            stopped_agent_owned_tools: HashSet::new(),
             active_web_search: None,
             active_image_generations: HashSet::new(),
             active_guardian_assessments: HashSet::new(),
@@ -135,6 +145,78 @@ impl PromptState {
         // Keep detached permission request tasks running so ACP can route the
         // client's required `Cancelled` response after session cancellation.
         self.pending_permission_interactions.clear();
+    }
+
+    pub(in crate::thread) fn stop_tool(
+        &mut self,
+        client: &SessionClient,
+        tool_call_id: &str,
+    ) -> bool {
+        let mut stopped = false;
+
+        if self
+            .active_commands
+            .remove(tool_call_id)
+            .or_else(|| self.remove_active_command_by_tool_call_id(tool_call_id))
+            .is_some()
+        {
+            stopped = true;
+        }
+
+        if self.active_web_search.as_deref() == Some(tool_call_id) {
+            self.active_web_search = None;
+            stopped = true;
+        }
+
+        if self.active_image_generations.remove(tool_call_id) {
+            stopped = true;
+        }
+
+        if self.active_agent_owned_tools.remove(tool_call_id) {
+            stopped = true;
+        }
+
+        if let Some(assessment_id) = self
+            .active_guardian_assessments
+            .iter()
+            .find(|id| guardian_assessment_tool_call_id(id) == tool_call_id)
+            .cloned()
+        {
+            self.active_guardian_assessments.remove(&assessment_id);
+            stopped = true;
+        }
+
+        if stopped {
+            self.stopped_agent_owned_tools
+                .insert(tool_call_id.to_string());
+            client.send_tool_call_update(ToolCallUpdate::new(
+                ToolCallId::new(tool_call_id.to_string()),
+                ToolCallUpdateFields::new()
+                    .status(ToolCallStatus::Failed)
+                    .content(vec![ToolCallContent::Content(Content::new(
+                        "Tool stopped by user",
+                    ))])
+                    .raw_output(json!({
+                        "interrupted": true,
+                        "reason": "tool stopped by user"
+                    })),
+            ));
+        }
+
+        stopped
+    }
+
+    fn remove_active_command_by_tool_call_id(
+        &mut self,
+        tool_call_id: &str,
+    ) -> Option<ActiveCommand> {
+        let command_id = self
+            .active_commands
+            .iter()
+            .find_map(|(command_id, command)| {
+                (command.tool_call_id.0.as_ref() == tool_call_id).then(|| command_id.clone())
+            })?;
+        self.active_commands.remove(&command_id)
     }
 
     fn spawn_permission_request(

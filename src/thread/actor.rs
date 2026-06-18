@@ -136,6 +136,13 @@ impl<A: Auth> ThreadActor<A> {
                 let result = self.handle_cancel().await;
                 drop(response_tx.send(result));
             }
+            ThreadMessage::StopTool {
+                tool_call_id,
+                response_tx,
+            } => {
+                let result = self.handle_stop_tool(tool_call_id).await;
+                drop(response_tx.send(result));
+            }
             ThreadMessage::Shutdown { response_tx } => {
                 let result = self.handle_shutdown().await;
                 drop(response_tx.send(result));
@@ -450,6 +457,24 @@ impl<A: Auth> ThreadActor<A> {
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
         Ok(())
+    }
+
+    async fn handle_stop_tool(&mut self, tool_call_id: String) -> Result<bool, Error> {
+        let mut stopped = false;
+        for submission in self.submissions.values_mut() {
+            if submission.stop_tool(&self.client, &tool_call_id) {
+                stopped = true;
+            }
+        }
+
+        if stopped {
+            self.thread
+                .submit(Op::Interrupt)
+                .await
+                .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+        }
+
+        Ok(stopped)
     }
 
     async fn handle_shutdown(&mut self) -> Result<(), Error> {

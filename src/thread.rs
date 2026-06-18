@@ -204,6 +204,10 @@ enum ThreadMessage {
     Cancel {
         response_tx: oneshot::Sender<Result<(), Error>>,
     },
+    StopTool {
+        tool_call_id: String,
+        response_tx: oneshot::Sender<Result<bool, Error>>,
+    },
     Shutdown {
         response_tx: oneshot::Sender<Result<(), Error>>,
     },
@@ -349,6 +353,20 @@ impl Thread {
         let (response_tx, response_rx) = oneshot::channel();
 
         let message = ThreadMessage::Cancel { response_tx };
+        drop(self.message_tx.send(message));
+
+        response_rx
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?
+    }
+
+    pub async fn stop_tool(&self, tool_call_id: String) -> Result<bool, Error> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let message = ThreadMessage::StopTool {
+            tool_call_id,
+            response_tx,
+        };
         drop(self.message_tx.send(message));
 
         response_rx
@@ -581,6 +599,23 @@ impl SessionClient {
             ))
             .await
     }
+}
+
+const KODEX_TOOL_STOP_META_KEY: &str = "kodex.ai/toolStop";
+
+fn agent_owned_tool_stop_meta(tool_call_id: &str) -> Meta {
+    Meta::from_iter([(
+        KODEX_TOOL_STOP_META_KEY.to_owned(),
+        json!({
+            "toolCallId": tool_call_id,
+            "stopKind": "agent_owned",
+        }),
+    )])
+}
+
+fn merge_meta(mut base: Meta, extra: Meta) -> Meta {
+    base.extend(extra);
+    base
 }
 
 #[cfg(test)]

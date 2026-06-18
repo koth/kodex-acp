@@ -144,7 +144,11 @@ impl PromptState {
         Ok(())
     }
 
-    pub(super) fn start_patch_apply(&self, client: &SessionClient, event: PatchApplyBeginEvent) {
+    pub(super) fn start_patch_apply(
+        &mut self,
+        client: &SessionClient,
+        event: PatchApplyBeginEvent,
+    ) {
         let raw_input = serde_json::json!(&event);
         let PatchApplyBeginEvent {
             call_id,
@@ -155,14 +159,16 @@ impl PromptState {
         } = event;
 
         let (title, locations, content) = extract_tool_call_content_from_changes(changes);
+        self.active_agent_owned_tools.insert(call_id.clone());
 
         client.send_tool_call(
-            ToolCall::new(call_id, title)
+            ToolCall::new(call_id.clone(), title)
                 .kind(ToolKind::Edit)
                 .status(ToolCallStatus::InProgress)
                 .locations(locations)
                 .content(content.collect())
-                .raw_input(raw_input),
+                .raw_input(raw_input)
+                .meta(Some(agent_owned_tool_stop_meta(&call_id))),
         );
     }
 
@@ -190,7 +196,7 @@ impl PromptState {
         ));
     }
 
-    pub(super) fn end_patch_apply(&self, client: &SessionClient, event: PatchApplyEndEvent) {
+    pub(super) fn end_patch_apply(&mut self, client: &SessionClient, event: PatchApplyEndEvent) {
         let raw_output = serde_json::json!(&event);
         let PatchApplyEndEvent {
             call_id,
@@ -210,6 +216,11 @@ impl PromptState {
             (None, None, None)
         };
 
+        if self.stopped_agent_owned_tools.remove(&call_id) {
+            return;
+        }
+        self.active_agent_owned_tools.remove(&call_id);
+
         let status = match status {
             PatchApplyStatus::Completed => ToolCallStatus::Completed,
             _ if success => ToolCallStatus::Completed,
@@ -228,35 +239,39 @@ impl PromptState {
     }
 
     pub(super) fn start_dynamic_tool_call(
-        &self,
+        &mut self,
         client: &SessionClient,
         call_id: String,
         tool: String,
         arguments: serde_json::Value,
     ) {
+        self.active_agent_owned_tools.insert(call_id.clone());
         client.send_tool_call(
-            ToolCall::new(call_id, format!("Tool: {tool}"))
+            ToolCall::new(call_id.clone(), format!("Tool: {tool}"))
                 .status(ToolCallStatus::InProgress)
-                .raw_input(serde_json::json!(&arguments)),
+                .raw_input(serde_json::json!(&arguments))
+                .meta(Some(agent_owned_tool_stop_meta(&call_id))),
         );
     }
 
     pub(super) fn start_mcp_tool_call(
-        &self,
+        &mut self,
         client: &SessionClient,
         call_id: String,
         invocation: McpInvocation,
     ) {
         let title = format!("Tool: {}/{}", invocation.server, invocation.tool);
+        self.active_agent_owned_tools.insert(call_id.clone());
         client.send_tool_call(
-            ToolCall::new(call_id, title)
+            ToolCall::new(call_id.clone(), title)
                 .status(ToolCallStatus::InProgress)
-                .raw_input(serde_json::json!(&invocation)),
+                .raw_input(serde_json::json!(&invocation))
+                .meta(Some(agent_owned_tool_stop_meta(&call_id))),
         );
     }
 
     pub(super) fn end_dynamic_tool_call(
-        &self,
+        &mut self,
         client: &SessionClient,
         event: DynamicToolCallResponseEvent,
     ) {
@@ -274,6 +289,11 @@ impl PromptState {
             duration: _,
             ..
         } = event;
+
+        if self.stopped_agent_owned_tools.remove(&call_id) {
+            return;
+        }
+        self.active_agent_owned_tools.remove(&call_id);
 
         client.send_tool_call_update(ToolCallUpdate::new(
             call_id,
@@ -304,11 +324,16 @@ impl PromptState {
     }
 
     pub(super) fn end_mcp_tool_call(
-        &self,
+        &mut self,
         client: &SessionClient,
         call_id: String,
         result: Result<CallToolResult, String>,
     ) {
+        if self.stopped_agent_owned_tools.remove(&call_id) {
+            return;
+        }
+        self.active_agent_owned_tools.remove(&call_id);
+
         let is_error = match result.as_ref() {
             Ok(result) => result.is_error.unwrap_or_default(),
             Err(_) => true,
@@ -503,16 +528,22 @@ impl PromptState {
         };
         let (content, meta) = if client.supports_terminal_output(&active_command) {
             let content = vec![ToolCallContent::Terminal(Terminal::new(call_id.clone()))];
-            let meta = Some(Meta::from_iter([(
-                "terminal_info".to_owned(),
-                serde_json::json!({
-                    "terminal_id": call_id,
-                    "cwd": cwd
-                }),
-            )]));
+            let meta = Some(merge_meta(
+                Meta::from_iter([(
+                    "terminal_info".to_owned(),
+                    serde_json::json!({
+                        "terminal_id": call_id,
+                        "cwd": cwd
+                    }),
+                )]),
+                agent_owned_tool_stop_meta(tool_call_id.0.as_ref()),
+            ));
             (content, meta)
         } else {
-            (vec![], None)
+            (
+                vec![],
+                Some(agent_owned_tool_stop_meta(tool_call_id.0.as_ref())),
+            )
         };
 
         self.active_commands.insert(call_id.clone(), active_command);
@@ -679,7 +710,11 @@ impl PromptState {
 
     pub(super) fn start_web_search(&mut self, client: &SessionClient, call_id: String) {
         self.active_web_search = Some(call_id.clone());
-        client.send_tool_call(ToolCall::new(call_id, "Searching the Web").kind(ToolKind::Fetch));
+        client.send_tool_call(
+            ToolCall::new(call_id.clone(), "Searching the Web")
+                .kind(ToolKind::Fetch)
+                .meta(Some(agent_owned_tool_stop_meta(&call_id))),
+        );
     }
 
     pub(super) fn start_image_generation(
@@ -691,10 +726,11 @@ impl PromptState {
         let ImageGenerationBeginEvent { call_id, .. } = event;
         self.active_image_generations.insert(call_id.clone());
         client.send_tool_call(
-            ToolCall::new(call_id, "Image generation")
+            ToolCall::new(call_id.clone(), "Image generation")
                 .kind(ToolKind::Other)
                 .status(ToolCallStatus::InProgress)
-                .raw_input(raw_input),
+                .raw_input(raw_input)
+                .meta(Some(agent_owned_tool_stop_meta(&call_id))),
         );
     }
 
@@ -716,6 +752,10 @@ impl PromptState {
         let saved_path = saved_path.map(|path| path.to_string_lossy().into_owned());
         let content = image_generation_content(revised_prompt, result, saved_path);
 
+        if self.stopped_agent_owned_tools.remove(&call_id) {
+            return;
+        }
+
         if self.active_image_generations.remove(&call_id) {
             client.send_tool_call_update(ToolCallUpdate::new(
                 call_id,
@@ -736,7 +776,7 @@ impl PromptState {
     }
 
     pub(super) fn update_web_search_query(
-        &self,
+        &mut self,
         client: &SessionClient,
         call_id: String,
         query: String,
@@ -760,6 +800,10 @@ impl PromptState {
             },
             WebSearchAction::Other => "Web search".to_string(),
         };
+
+        if self.stopped_agent_owned_tools.remove(&call_id) {
+            return;
+        }
 
         client.send_tool_call_update(ToolCallUpdate::new(
             call_id,
@@ -941,15 +985,20 @@ impl PromptState {
         let content = guardian_assessment_content(&event);
         let raw_event = serde_json::json!(&event);
 
+        if self.stopped_agent_owned_tools.contains(&call_id) {
+            return;
+        }
+
         match event.status {
             GuardianAssessmentStatus::InProgress => {
                 if self.active_guardian_assessments.insert(event.id.clone()) {
                     client.send_tool_call(
-                        ToolCall::new(call_id, "Guardian Review")
+                        ToolCall::new(call_id.clone(), "Guardian Review")
                             .kind(ToolKind::Think)
                             .status(status)
                             .content(content)
-                            .raw_input(raw_event),
+                            .raw_input(raw_event)
+                            .meta(Some(agent_owned_tool_stop_meta(&call_id))),
                     );
                 } else {
                     client.send_tool_call_update(ToolCallUpdate::new(
@@ -965,6 +1014,9 @@ impl PromptState {
             | GuardianAssessmentStatus::Approved
             | GuardianAssessmentStatus::Denied
             | GuardianAssessmentStatus::Aborted => {
+                if self.stopped_agent_owned_tools.remove(&call_id) {
+                    return;
+                }
                 if self.active_guardian_assessments.remove(&event.id) {
                     client.send_tool_call_update(ToolCallUpdate::new(
                         call_id,

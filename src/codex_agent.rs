@@ -10,7 +10,7 @@ use acp::schema::{
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
     SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
 };
-use acp::{Agent, Client, ConnectTo, ConnectionTo, Error};
+use acp::{Agent, Client, ConnectTo, ConnectionTo, Error, JsonRpcNotification};
 use agent_client_protocol as acp;
 use codex_config::{DEFAULT_MCP_SERVER_ENVIRONMENT_ID, McpServerConfig, McpServerTransportConfig};
 use codex_core::{
@@ -29,6 +29,7 @@ use codex_protocol::{
     ThreadId,
     protocol::{InitialHistory, SessionSource},
 };
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -60,9 +61,18 @@ pub struct CodexAgent {
 }
 
 const SESSION_LIST_PAGE_SIZE: usize = 25;
+const KODEX_TOOL_STOP_METHOD: &str = "kodex.ai/tool_stop";
 const KODEX_FILE_EDITING_DEVELOPER_INSTRUCTIONS: &str = r#"Kodex file editing rule:
 - Do not directly create, overwrite, append, rename, move, or delete files through shell commands, Python/Node scripts, redirection, here-documents, tee, Set-Content, Remove-Item, mv/cp/rm, or similar filesystem-mutating shell commands.
 - Use the apply_patch tool/function for file edits. Shell commands are for read-only inspection or validation unless the user explicitly asks for a shell-based operation."#;
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcNotification)]
+#[notification(method = "kodex.ai/tool_stop")]
+#[serde(rename_all = "camelCase")]
+struct ToolStopNotification {
+    session_id: SessionId,
+    tool_call_id: String,
+}
 
 fn merge_kodex_developer_instructions(existing: Option<String>) -> Option<String> {
     match existing {
@@ -271,6 +281,22 @@ impl CodexAgent {
                         cx.spawn(async move {
                             if let Err(e) = agent.cancel(notification).await {
                                 tracing::error!("Error handling cancel: {:?}", e);
+                            }
+                            Ok(())
+                        })?;
+                        Ok(())
+                    }
+                },
+                acp::on_receive_notification!(),
+            )
+            .on_receive_notification(
+                {
+                    let agent = agent.clone();
+                    async move |notification: ToolStopNotification, cx: ConnectionTo<Client>| {
+                        let agent = agent.clone();
+                        cx.spawn(async move {
+                            if let Err(e) = agent.tool_stop(notification).await {
+                                tracing::error!("Error handling {KODEX_TOOL_STOP_METHOD}: {:?}", e);
                             }
                             Ok(())
                         })?;
@@ -838,6 +864,17 @@ impl CodexAgent {
     async fn cancel(&self, args: CancelNotification) -> Result<(), Error> {
         info!("Cancelling operations for session: {}", args.session_id);
         self.get_thread(&args.session_id)?.cancel().await?;
+        Ok(())
+    }
+
+    async fn tool_stop(&self, args: ToolStopNotification) -> Result<(), Error> {
+        info!(
+            "Stopping tool {} for session: {}",
+            args.tool_call_id, args.session_id
+        );
+        self.get_thread(&args.session_id)?
+            .stop_tool(args.tool_call_id)
+            .await?;
         Ok(())
     }
 

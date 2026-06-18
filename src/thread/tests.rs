@@ -317,6 +317,27 @@ impl CodexThreadImpl for StubCodexThread {
                             duration_ms: None,
                             time_to_first_token_ms: None,
                         }));
+                    } else if prompt == "long-exec" {
+                        let turn_id = id.to_string();
+                        let cwd = std::env::current_dir().unwrap();
+                        self.op_tx
+                            .send(Event {
+                                id: id.to_string(),
+                                msg: EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
+                                    call_id: "call-long".into(),
+                                    process_id: None,
+                                    turn_id,
+                                    command: vec!["sleep".into(), "60".into()],
+                                    cwd: cwd.try_into()?,
+                                    parsed_cmd: vec![ParsedCommand::Unknown {
+                                        cmd: "sleep 60".into(),
+                                    }],
+                                    source: Default::default(),
+                                    interaction_input: None,
+                                    started_at_ms: 0,
+                                }),
+                            })
+                            .unwrap();
                     } else if prompt == "title-sync" {
                         let turn_id = id.to_string();
                         let send = |msg| {
@@ -824,4 +845,104 @@ async fn test_parallel_exec_commands() -> anyhow::Result<()> {
     );
 
     Ok(())
+}
+
+#[tokio::test]
+async fn stop_tool_interrupts_only_registered_in_flight_tool() -> anyhow::Result<()> {
+    let (session_id, client, conversation, message_tx, _handle) = setup().await?;
+    let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+    message_tx.send(ThreadMessage::Prompt {
+        request: PromptRequest::new(session_id.clone(), vec!["long-exec".into()]),
+        response_tx: prompt_response_tx,
+    })?;
+
+    let _prompt_stop_rx = prompt_response_rx.await??;
+
+    let tool_call = wait_for_tool_call(&client, "call-long").await?;
+    let tool_stop = tool_call
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.get(KODEX_TOOL_STOP_META_KEY))
+        .expect("tool call should include stop metadata");
+    assert_eq!(
+        tool_stop
+            .get("toolCallId")
+            .and_then(serde_json::Value::as_str),
+        Some("call-long")
+    );
+    assert_eq!(
+        tool_stop
+            .get("stopKind")
+            .and_then(serde_json::Value::as_str),
+        Some("agent_owned")
+    );
+
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    message_tx.send(ThreadMessage::StopTool {
+        tool_call_id: "call-long".into(),
+        response_tx: stop_tx,
+    })?;
+    assert!(stop_rx.await??);
+
+    let ops = conversation.ops.lock().unwrap();
+    assert!(matches!(ops.last(), Some(Op::Interrupt)));
+    drop(ops);
+
+    let notifications = client.notifications.lock().unwrap();
+    assert!(notifications.iter().any(|notification| {
+        matches!(
+            &notification.update,
+            SessionUpdate::ToolCallUpdate(update)
+                if update.tool_call_id.0.as_ref() == "call-long"
+                    && update.fields.status == Some(ToolCallStatus::Failed)
+        )
+    }));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn stop_tool_ignores_unknown_tool_without_interrupting_turn() -> anyhow::Result<()> {
+    let (_session_id, _client, conversation, message_tx, _handle) = setup().await?;
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+
+    message_tx.send(ThreadMessage::StopTool {
+        tool_call_id: "missing-tool".into(),
+        response_tx: stop_tx,
+    })?;
+
+    assert!(!stop_rx.await??);
+    let ops = conversation.ops.lock().unwrap();
+    assert!(
+        !ops.iter().any(|op| matches!(op, Op::Interrupt)),
+        "unknown tool stop must not interrupt the turn"
+    );
+
+    Ok(())
+}
+
+async fn wait_for_tool_call(client: &StubClient, tool_call_id: &str) -> anyhow::Result<ToolCall> {
+    for _ in 0..50 {
+        if let Some(tool_call) =
+            client
+                .notifications
+                .lock()
+                .unwrap()
+                .iter()
+                .find_map(|notification| match &notification.update {
+                    SessionUpdate::ToolCall(tool_call)
+                        if tool_call.tool_call_id.0.as_ref() == tool_call_id =>
+                    {
+                        Some(tool_call.clone())
+                    }
+                    _ => None,
+                })
+        {
+            return Ok(tool_call);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    anyhow::bail!("timed out waiting for tool call {tool_call_id}");
 }
