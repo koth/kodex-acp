@@ -560,6 +560,13 @@ pub(super) fn build_user_input_permission_request(
     (title, content, options, option_map)
 }
 
+pub(super) fn user_input_permission_meta(questions: &[RequestUserInputQuestion]) -> Meta {
+    Meta::from_iter([(
+        KODEX_PERMISSION_INPUT_META_KEY.to_string(),
+        serde_json::json!({ "questions": questions }),
+    )])
+}
+
 pub(super) fn user_input_question_label(question: &RequestUserInputQuestion) -> String {
     let header = question.header.trim();
     if !header.is_empty() {

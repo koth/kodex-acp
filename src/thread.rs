@@ -41,7 +41,7 @@ use codex_protocol::{
         ElicitationRequest, ElicitationRequestEvent, GuardianAssessmentAction,
         GuardianCommandSource,
     },
-    config_types::{ReasoningSummary, TrustLevel},
+    config_types::{CollaborationMode, ModeKind, ReasoningSummary, Settings, TrustLevel},
     dynamic_tools::{DynamicToolCallOutputContentItem, DynamicToolCallRequest},
     error::CodexErr,
     items::TurnItem,
@@ -54,6 +54,7 @@ use codex_protocol::{
     parse_command::ParsedCommand,
     permissions::{
         FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry, FileSystemSpecialPath,
+        NetworkSandboxPolicy,
     },
     plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
     protocol::{
@@ -64,11 +65,11 @@ use codex_protocol::{
         ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandStatus, ExitedReviewModeEvent,
         FileChange, GuardianAssessmentEvent, GuardianAssessmentStatus, ImageGenerationBeginEvent,
         ImageGenerationEndEvent, ItemCompletedEvent, ItemStartedEvent, McpInvocation,
-        McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent,
-        ModelRerouteEvent, NetworkApprovalContext, NetworkPolicyRuleAction, Op,
-        PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, PatchApplyUpdatedEvent,
-        ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision,
-        ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem, SessionSource,
+        McpServerRefreshConfig, McpStartupCompleteEvent, McpStartupUpdateEvent,
+        McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent, NetworkApprovalContext,
+        NetworkPolicyRuleAction, Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus,
+        PatchApplyUpdatedEvent, ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent,
+        ReviewDecision, ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem, SessionSource,
         StreamErrorEvent, TerminalInteractionEvent, ThreadGoalStatus, ThreadGoalUpdatedEvent,
         ThreadSettingsOverrides, TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent,
         TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent,
@@ -118,18 +119,19 @@ use permissions::{
     build_supported_mcp_elicitation_permission_request, build_user_input_permission_request,
     empty_user_input_response, exec_request_key, format_thread_goal_update,
     parse_command_tool_call, patch_request_key, permission_guidance_followup,
-    permission_guidance_from_response, permissions_request_key, user_input_request_key,
-    user_input_response_from_answer, user_input_response_from_permission_response,
+    permission_guidance_from_response, permissions_request_key, user_input_permission_meta,
+    user_input_request_key, user_input_response_from_answer,
+    user_input_response_from_permission_response,
 };
 use prompt_state::{ActiveCommand, PromptState, SubmissionState};
 use session_config::{
     APPROVAL_PRESETS, INIT_COMMAND_PROMPT, KODEX_CONTEXT_COMPACTED_META_KEY,
     KODEX_CONTEXT_COMPACTION_META_KEY, KODEX_MODEL_PROVIDER_MAP_ENV,
-    KODEX_PERMISSION_GUIDANCE_META_KEY, KODEX_PROVIDER_VALUE_PREFIX,
-    KODEX_USER_INPUT_ANSWERS_META_KEY, KodexModelProviderEntry, SESSION_TITLE_GENERATION_TIMEOUT,
-    SESSION_TITLE_INSTRUCTIONS, SESSION_TITLE_MAX_CHARS, SESSION_TITLE_PROMPT_MAX_CHARS,
-    SESSION_TITLE_ROLLBACK_TIMEOUT, active_profile_id_for_session_mode, current_session_mode_id,
-    mode_trusts_project,
+    KODEX_PERMISSION_GUIDANCE_META_KEY, KODEX_PERMISSION_INPUT_META_KEY,
+    KODEX_PROVIDER_VALUE_PREFIX, KODEX_USER_INPUT_ANSWERS_META_KEY, KodexModelProviderEntry,
+    SESSION_TITLE_GENERATION_TIMEOUT, SESSION_TITLE_INSTRUCTIONS, SESSION_TITLE_MAX_CHARS,
+    SESSION_TITLE_PROMPT_MAX_CHARS, SESSION_TITLE_ROLLBACK_TIMEOUT,
+    active_profile_id_for_session_mode, current_session_mode_id, mode_trusts_project,
 };
 pub use title::generate_session_title_with_model;
 use title::{
@@ -388,6 +390,14 @@ impl Thread {
             .map_err(|e| Error::internal_error().data(e.to_string()))?
     }
 
+    pub async fn refresh_mcp_servers(&self, config: McpServerRefreshConfig) -> Result<(), Error> {
+        self.thread
+            .submit(Op::RefreshMcpServers { config })
+            .await
+            .map(|_| ())
+            .map_err(|e| Error::internal_error().data(e.to_string()))
+    }
+
     pub async fn shutdown(&self) -> Result<(), Error> {
         let (response_tx, response_rx) = oneshot::channel();
         let message = ThreadMessage::Shutdown { response_tx };
@@ -586,18 +596,18 @@ impl SessionClient {
         )));
     }
 
-    async fn request_permission(
+    async fn request_permission_with_meta(
         &self,
         tool_call: ToolCallUpdate,
         options: Vec<PermissionOption>,
+        meta: Option<Meta>,
     ) -> Result<RequestPermissionResponse, Error> {
-        self.client
-            .request_permission(RequestPermissionRequest::new(
-                self.session_id.clone(),
-                tool_call,
-                options,
-            ))
-            .await
+        let mut request =
+            RequestPermissionRequest::new(self.session_id.clone(), tool_call, options);
+        if let Some(meta) = meta {
+            request = request.meta(meta);
+        }
+        self.client.request_permission(request).await
     }
 }
 

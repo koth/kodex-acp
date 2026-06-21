@@ -486,4 +486,23 @@ impl<A: Auth> ThreadActor<A> {
 
         Ok(SessionModelState::new(current_model_id, available_models))
     }
+
+    pub(super) async fn collaboration_mode_for_session_mode(
+        &self,
+        mode_id: &str,
+    ) -> CollaborationMode {
+        let mode = if mode_id == "read-only" {
+            ModeKind::Plan
+        } else {
+            ModeKind::Default
+        };
+        CollaborationMode {
+            mode,
+            settings: Settings {
+                model: self.get_current_model().await,
+                reasoning_effort: self.config.model_reasoning_effort,
+                developer_instructions: None,
+            },
+        }
+    }
 }

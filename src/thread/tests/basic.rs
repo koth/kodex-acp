@@ -124,6 +124,76 @@ async fn test_thread_goal_updated_is_sent_as_agent_message() -> anyhow::Result<(
 }
 
 #[tokio::test]
+async fn prompt_during_active_regular_turn_is_submitted_as_user_input() -> anyhow::Result<()> {
+    let (session_id, _client, thread, message_tx, _handle) = setup().await?;
+    let (first_response_tx, first_response_rx) = tokio::sync::oneshot::channel();
+
+    message_tx.send(ThreadMessage::Prompt {
+        request: PromptRequest::new(session_id.clone(), vec!["long-exec".into()]),
+        response_tx: first_response_tx,
+    })?;
+    let first_stop_rx = first_response_rx.await??;
+
+    let (steer_response_tx, steer_response_rx) = tokio::sync::oneshot::channel();
+    message_tx.send(ThreadMessage::Prompt {
+        request: PromptRequest::new(session_id.clone(), vec!["steer while running".into()]),
+        response_tx: steer_response_tx,
+    })?;
+
+    let stop_reason = steer_response_rx.await??.await??;
+    assert_eq!(stop_reason, StopReason::EndTurn);
+
+    let ops = thread.ops.lock().unwrap();
+    assert_eq!(ops.len(), 2);
+    assert!(matches!(
+        &ops[0],
+        Op::UserInput { items, .. }
+            if prompt_text_from_items(items).as_deref() == Some("long-exec")
+    ));
+    assert!(matches!(
+        &ops[1],
+        Op::UserInput { items, .. }
+            if prompt_text_from_items(items).as_deref() == Some("steer while running")
+    ));
+    drop(ops);
+    drop(first_stop_rx);
+    drop(message_tx);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn prompt_during_non_steerable_turn_returns_clear_error() -> anyhow::Result<()> {
+    let (session_id, _client, _thread, message_tx, _handle) = setup().await?;
+    let (first_response_tx, first_response_rx) = tokio::sync::oneshot::channel();
+
+    message_tx.send(ThreadMessage::Prompt {
+        request: PromptRequest::new(session_id.clone(), vec!["long-exec".into()]),
+        response_tx: first_response_tx,
+    })?;
+    let first_stop_rx = first_response_rx.await??;
+
+    let (steer_response_tx, steer_response_rx) = tokio::sync::oneshot::channel();
+    message_tx.send(ThreadMessage::Prompt {
+        request: PromptRequest::new(session_id.clone(), vec!["steer-reject".into()]),
+        response_tx: steer_response_tx,
+    })?;
+
+    let error = steer_response_rx
+        .await?
+        .expect_err("steer should be rejected");
+    assert!(
+        error.to_string().contains("active turn is not steerable")
+            || format!("{error:?}").contains("active turn is not steerable"),
+        "unexpected error: {error:?}",
+    );
+    drop(first_stop_rx);
+    drop(message_tx);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_image_generation_emits_image_content() -> anyhow::Result<()> {
     let (session_id, client, _, message_tx, _handle) = setup().await?;
     let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
@@ -261,6 +331,20 @@ fn test_guardian_execve_summary_uses_argv_without_duplication() -> anyhow::Resul
     Ok(())
 }
 
+#[test]
+fn auto_mode_preset_enables_network_access() {
+    let preset = APPROVAL_PRESETS
+        .iter()
+        .find(|preset| preset.id == "auto")
+        .expect("auto mode preset should exist");
+
+    assert_eq!(
+        preset.permission_profile.network_sandbox_policy(),
+        NetworkSandboxPolicy::Enabled
+    );
+    assert!(preset.description.contains("access the internet"));
+}
+
 #[tokio::test]
 async fn modes_match_augmented_workspace_permission_profile() -> anyhow::Result<()> {
     let mut config =
@@ -329,6 +413,80 @@ fn read_only_mode_does_not_trust_project() {
     assert!(!mode_trusts_project("read-only"));
     assert!(mode_trusts_project("auto"));
     assert!(mode_trusts_project("full-access"));
+}
+
+#[tokio::test]
+async fn config_options_do_not_expose_separate_codex_collaboration_mode() -> anyhow::Result<()> {
+    let (_, _, _, message_tx, _handle) = setup().await?;
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+    message_tx.send(ThreadMessage::GetConfigOptions { response_tx })?;
+    let options = response_rx.await??;
+
+    assert!(
+        options
+            .iter()
+            .all(|option| option.id.0.as_ref() != "codex_collaboration_mode")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn setting_read_only_mode_updates_collaboration_mode_to_plan() -> anyhow::Result<()> {
+    let (_, _, thread, message_tx, _handle) = setup().await?;
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+    message_tx.send(ThreadMessage::SetMode {
+        mode: SessionModeId::new("read-only"),
+        response_tx,
+    })?;
+    response_rx.await??;
+
+    let ops = thread.ops.lock().unwrap();
+    let Some(Op::ThreadSettings { thread_settings }) = ops.last() else {
+        panic!("expected thread settings update");
+    };
+    let collaboration_mode = thread_settings
+        .collaboration_mode
+        .as_ref()
+        .expect("collaboration mode should be set");
+    assert_eq!(collaboration_mode.mode, ModeKind::Plan);
+    assert!(!collaboration_mode.model().is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn setting_auto_mode_updates_collaboration_mode_to_default() -> anyhow::Result<()> {
+    let (_, _, thread, message_tx, _handle) = setup().await?;
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+    message_tx.send(ThreadMessage::SetMode {
+        mode: SessionModeId::new("auto"),
+        response_tx,
+    })?;
+    response_rx.await??;
+
+    let ops = thread.ops.lock().unwrap();
+    let Some(Op::ThreadSettings { thread_settings }) = ops.last() else {
+        panic!("expected thread settings update");
+    };
+    let collaboration_mode = thread_settings
+        .collaboration_mode
+        .as_ref()
+        .expect("collaboration mode should be set");
+    assert_eq!(collaboration_mode.mode, ModeKind::Default);
+    let permission_profile = thread_settings
+        .permission_profile
+        .as_ref()
+        .expect("permission profile should be set");
+    assert_eq!(
+        permission_profile.network_sandbox_policy(),
+        NetworkSandboxPolicy::Enabled
+    );
+
+    Ok(())
 }
 
 #[tokio::test]

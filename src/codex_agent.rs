@@ -27,7 +27,7 @@ use codex_login::{
 };
 use codex_protocol::{
     ThreadId,
-    protocol::{InitialHistory, SessionSource},
+    protocol::{InitialHistory, McpServerRefreshConfig, SessionSource},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -62,6 +62,7 @@ pub struct CodexAgent {
 
 const SESSION_LIST_PAGE_SIZE: usize = 25;
 const KODEX_TOOL_STOP_METHOD: &str = "kodex.ai/tool_stop";
+const KODEX_WEB_TOOLS_MCP_SERVER_NAME: &str = "kodex-web-tools";
 const KODEX_FILE_EDITING_DEVELOPER_INSTRUCTIONS: &str = r#"Kodex file editing rule:
 - Do not directly create, overwrite, append, rename, move, or delete files through shell commands, Python/Node scripts, redirection, here-documents, tee, Set-Content, Remove-Item, mv/cp/rm, or similar filesystem-mutating shell commands.
 - Use the apply_patch tool/function for file edits. Shell commands are for read-only inspection or validation unless the user explicitly asks for a shell-based operation."#;
@@ -85,6 +86,103 @@ fn merge_kodex_developer_instructions(existing: Option<String>) -> Option<String
             KODEX_FILE_EDITING_DEVELOPER_INSTRUCTIONS
         )),
         _ => Some(KODEX_FILE_EDITING_DEVELOPER_INSTRUCTIONS.to_string()),
+    }
+}
+
+fn normalize_client_mcp_server_name(name: String) -> String {
+    // Codex does not allow whitespace in MCP server names; replace with underscores.
+    name.replace(|c: char| c.is_whitespace(), "_")
+}
+
+fn is_required_client_mcp_server(name: &str) -> bool {
+    // Kodex owns this per-session MCP server, and web_search/web_fetch should be
+    // visible before the model starts the first turn.
+    name == KODEX_WEB_TOOLS_MCP_SERVER_NAME
+}
+
+fn client_mcp_server_config(
+    mcp_server: McpServer,
+    cwd: &Path,
+) -> Option<(String, McpServerConfig)> {
+    match mcp_server {
+        // Not supported in codex.
+        McpServer::Sse(..) => None,
+        McpServer::Http(McpServerHttp {
+            name, url, headers, ..
+        }) => {
+            let name = normalize_client_mcp_server_name(name);
+            let required = is_required_client_mcp_server(&name);
+            Some((
+                name,
+                McpServerConfig {
+                    transport: McpServerTransportConfig::StreamableHttp {
+                        url,
+                        bearer_token_env_var: None,
+                        http_headers: if headers.is_empty() {
+                            None
+                        } else {
+                            Some(headers.into_iter().map(|h| (h.name, h.value)).collect())
+                        },
+                        env_http_headers: None,
+                    },
+                    environment_id: DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
+                    required,
+                    enabled: true,
+                    startup_timeout_sec: None,
+                    tool_timeout_sec: None,
+                    disabled_tools: None,
+                    enabled_tools: None,
+                    disabled_reason: None,
+                    scopes: None,
+                    oauth: None,
+                    oauth_resource: None,
+                    tools: Default::default(),
+                    supports_parallel_tool_calls: false,
+                    default_tools_approval_mode: None,
+                },
+            ))
+        }
+        McpServer::Stdio(McpServerStdio {
+            name,
+            command,
+            args,
+            env,
+            ..
+        }) => {
+            let name = normalize_client_mcp_server_name(name);
+            let required = is_required_client_mcp_server(&name);
+            Some((
+                name,
+                McpServerConfig {
+                    transport: McpServerTransportConfig::Stdio {
+                        command: command.display().to_string(),
+                        args,
+                        env: if env.is_empty() {
+                            None
+                        } else {
+                            Some(env.into_iter().map(|env| (env.name, env.value)).collect())
+                        },
+                        env_vars: vec![],
+                        cwd: Some(cwd.to_path_buf()),
+                    },
+                    environment_id: DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
+                    required,
+                    enabled: true,
+                    startup_timeout_sec: None,
+                    tool_timeout_sec: None,
+                    disabled_tools: None,
+                    enabled_tools: None,
+                    disabled_reason: None,
+                    scopes: None,
+                    oauth: None,
+                    oauth_resource: None,
+                    tools: Default::default(),
+                    supports_parallel_tool_calls: false,
+                    default_tools_approval_mode: None,
+                },
+            ))
+        }
+        _ => None,
     }
 }
 
@@ -400,85 +498,9 @@ impl CodexAgent {
         // Propagate any client-provided MCP servers that codex-rs supports.
         let mut new_mcp_servers = config.mcp_servers.get().clone();
         for mcp_server in mcp_servers {
-            match mcp_server {
-                // Not supported in codex
-                McpServer::Sse(..) => {}
-                McpServer::Http(McpServerHttp {
-                    name, url, headers, ..
-                }) => {
-                    // Codex does not allow whitespace in MCP server names; replace with underscores.
-                    let name = name.replace(|c: char| c.is_whitespace(), "_");
-                    new_mcp_servers.insert(
-                        name,
-                        McpServerConfig {
-                            transport: McpServerTransportConfig::StreamableHttp {
-                                url,
-                                bearer_token_env_var: None,
-                                http_headers: if headers.is_empty() {
-                                    None
-                                } else {
-                                    Some(headers.into_iter().map(|h| (h.name, h.value)).collect())
-                                },
-                                env_http_headers: None,
-                            },
-                            environment_id: DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
-                            required: false,
-                            enabled: true,
-                            startup_timeout_sec: None,
-                            tool_timeout_sec: None,
-                            disabled_tools: None,
-                            enabled_tools: None,
-                            disabled_reason: None,
-                            scopes: None,
-                            oauth: None,
-                            oauth_resource: None,
-                            tools: Default::default(),
-                            supports_parallel_tool_calls: false,
-                            default_tools_approval_mode: None,
-                        },
-                    );
-                }
-                McpServer::Stdio(McpServerStdio {
-                    name,
-                    command,
-                    args,
-                    env,
-                    ..
-                }) => {
-                    // Codex does not allow whitespace in MCP server names; replace with underscores.
-                    let name = name.replace(|c: char| c.is_whitespace(), "_");
-                    new_mcp_servers.insert(
-                        name,
-                        McpServerConfig {
-                            transport: McpServerTransportConfig::Stdio {
-                                command: command.display().to_string(),
-                                args,
-                                env: if env.is_empty() {
-                                    None
-                                } else {
-                                    Some(env.into_iter().map(|env| (env.name, env.value)).collect())
-                                },
-                                env_vars: vec![],
-                                cwd: Some(cwd.to_path_buf()),
-                            },
-                            environment_id: DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
-                            required: false,
-                            enabled: true,
-                            startup_timeout_sec: None,
-                            tool_timeout_sec: None,
-                            disabled_tools: None,
-                            enabled_tools: None,
-                            disabled_reason: None,
-                            scopes: None,
-                            oauth: None,
-                            oauth_resource: None,
-                            tools: Default::default(),
-                            supports_parallel_tool_calls: false,
-                            default_tools_approval_mode: None,
-                        },
-                    );
-                }
-                _ => {}
+            if let Some((name, server_config)) = client_mcp_server_config(mcp_server, cwd.as_ref())
+            {
+                new_mcp_servers.insert(name, server_config);
             }
         }
 
@@ -488,6 +510,24 @@ impl CodexAgent {
             .map_err(|e| anyhow::anyhow!(e))?;
 
         Ok(config)
+    }
+
+    async fn build_mcp_server_refresh_config(
+        &self,
+        config: &Config,
+    ) -> Result<McpServerRefreshConfig, Error> {
+        let mcp_servers = self
+            .thread_manager
+            .mcp_manager()
+            .configured_servers(config)
+            .await;
+        Ok(McpServerRefreshConfig {
+            mcp_servers: serde_json::to_value(mcp_servers).map_err(Error::into_internal_error)?,
+            mcp_oauth_credentials_store_mode: serde_json::to_value(
+                config.mcp_oauth_credentials_store_mode,
+            )
+            .map_err(Error::into_internal_error)?,
+        })
     }
 }
 
@@ -636,6 +676,9 @@ impl CodexAgent {
             config.clone(),
             cx,
         ));
+        thread
+            .refresh_mcp_servers(self.build_mcp_server_refresh_config(&config).await?)
+            .await?;
         let load = thread.load().await?;
 
         self.sessions
@@ -710,6 +753,10 @@ impl CodexAgent {
             config.clone(),
             cx,
         ));
+
+        thread
+            .refresh_mcp_servers(self.build_mcp_server_refresh_config(&config).await?)
+            .await?;
 
         thread.replay_history(rollout_items).await?;
 

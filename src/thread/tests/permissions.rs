@@ -264,6 +264,42 @@ async fn test_request_user_input_routes_to_permission_request() -> anyhow::Resul
         let requests = client.permission_requests.lock().unwrap();
         let request = requests.last().unwrap();
         assert_eq!(request.tool_call.tool_call_id.0.as_ref(), "call-user-input");
+        let expected_input_meta = json!({
+            "questions": [
+                {
+                    "id": "approach",
+                    "header": "Approach",
+                    "question": "Which approach should I take?",
+                    "isOther": false,
+                    "isSecret": false,
+                    "options": [
+                        {
+                            "label": "First",
+                            "description": "Use the first path."
+                        },
+                        {
+                            "label": "Second",
+                            "description": "Use the second path."
+                        }
+                    ]
+                }
+            ]
+        });
+        assert_eq!(
+            request
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get(KODEX_PERMISSION_INPUT_META_KEY)),
+            Some(&expected_input_meta)
+        );
+        assert_eq!(
+            request
+                .tool_call
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get(KODEX_PERMISSION_INPUT_META_KEY)),
+            Some(&expected_input_meta)
+        );
         assert_eq!(
             request
                 .options

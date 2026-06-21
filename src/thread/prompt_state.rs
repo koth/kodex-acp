@@ -226,6 +226,7 @@ impl PromptState {
         pending_request: PendingPermissionRequest,
         tool_call: ToolCallUpdate,
         options: Vec<PermissionOption>,
+        request_meta: Option<Meta>,
     ) {
         let interaction_id = self.next_permission_interaction_id;
         self.next_permission_interaction_id = self.next_permission_interaction_id.wrapping_add(1);
@@ -234,7 +235,9 @@ impl PromptState {
         let submission_id = self.submission_id.clone();
         let resolved_request_key = request_key.clone();
         drop(tokio::spawn(async move {
-            let response = client.request_permission(tool_call, options).await;
+            let response = client
+                .request_permission_with_meta(tool_call, options, request_meta)
+                .await;
             drop(
                 resolution_tx.send(ThreadMessage::PermissionRequestResolved {
                     submission_id,

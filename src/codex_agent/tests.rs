@@ -1,8 +1,12 @@
 use super::InitializeResponse;
 use super::{
-    KODEX_FILE_EDITING_DEVELOPER_INSTRUCTIONS, ProtocolVersion, build_agent_capabilities,
-    distinct_session_title, merge_kodex_developer_instructions,
+    KODEX_FILE_EDITING_DEVELOPER_INSTRUCTIONS, KODEX_WEB_TOOLS_MCP_SERVER_NAME, ProtocolVersion,
+    build_agent_capabilities, client_mcp_server_config, distinct_session_title,
+    merge_kodex_developer_instructions,
 };
+use agent_client_protocol::schema::{McpServer, McpServerHttp};
+use codex_config::McpServerTransportConfig;
+use std::path::Path;
 
 #[test]
 fn distinct_session_title_ignores_first_user_message() {
@@ -62,4 +66,36 @@ fn kodex_developer_instructions_are_not_duplicated() {
     let merged = merge_kodex_developer_instructions(Some(existing.clone())).expect("instructions");
 
     assert_eq!(merged, existing);
+}
+
+#[test]
+fn kodex_web_tools_mcp_server_is_required() {
+    let server = McpServer::Http(McpServerHttp::new(
+        KODEX_WEB_TOOLS_MCP_SERVER_NAME,
+        "http://127.0.0.1:34567/mcp",
+    ));
+
+    let (name, config) =
+        client_mcp_server_config(server, Path::new("/tmp/project")).expect("supported mcp server");
+
+    assert_eq!(name, KODEX_WEB_TOOLS_MCP_SERVER_NAME);
+    assert!(config.required);
+    assert!(matches!(
+        config.transport,
+        McpServerTransportConfig::StreamableHttp { .. }
+    ));
+}
+
+#[test]
+fn generic_client_mcp_server_remains_optional() {
+    let server = McpServer::Http(McpServerHttp::new(
+        "docs search",
+        "http://127.0.0.1:34567/mcp",
+    ));
+
+    let (name, config) =
+        client_mcp_server_config(server, Path::new("/tmp/project")).expect("supported mcp server");
+
+    assert_eq!(name, "docs_search");
+    assert!(!config.required);
 }

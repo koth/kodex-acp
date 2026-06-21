@@ -369,6 +369,7 @@ impl<A: Auth> ThreadActor<A> {
             .iter()
             .find(|preset| mode.0.as_ref() == preset.id)
             .ok_or_else(Error::invalid_params)?;
+        let collaboration_mode = self.collaboration_mode_for_session_mode(preset.id).await;
 
         self.thread
             .submit(Op::ThreadSettings {
@@ -377,6 +378,7 @@ impl<A: Auth> ThreadActor<A> {
                     permission_profile: Some(preset.permission_profile.clone()),
                     active_permission_profile: active_profile_id_for_session_mode(preset.id)
                         .map(ActivePermissionProfile::new),
+                    collaboration_mode: Some(collaboration_mode),
                     ..Default::default()
                 },
             })

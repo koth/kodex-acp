@@ -1,5 +1,43 @@
 use super::*;
 
+fn mcp_tool_title_and_kind(invocation: &McpInvocation) -> (String, ToolKind) {
+    match invocation.tool.as_str() {
+        "web_search" => {
+            let query = invocation
+                .arguments
+                .as_ref()
+                .and_then(|arguments| arguments.get("query"))
+                .and_then(|query| query.as_str())
+                .map(str::trim)
+                .filter(|query| !query.is_empty());
+            (
+                query
+                    .map(|query| format!("Search web: {query}"))
+                    .unwrap_or_else(|| "Search web".to_string()),
+                ToolKind::Search,
+            )
+        }
+        "web_fetch" => {
+            let url = invocation
+                .arguments
+                .as_ref()
+                .and_then(|arguments| arguments.get("url"))
+                .and_then(|url| url.as_str())
+                .map(str::trim)
+                .filter(|url| !url.is_empty());
+            (
+                url.map(|url| format!("Fetch web: {url}"))
+                    .unwrap_or_else(|| "Fetch web".to_string()),
+                ToolKind::Fetch,
+            )
+        }
+        _ => (
+            format!("Tool: {}/{}", invocation.server, invocation.tool),
+            ToolKind::Other,
+        ),
+    }
+}
+
 impl PromptState {
     pub(in crate::thread) async fn mcp_elicitation(
         &mut self,
@@ -34,6 +72,7 @@ impl PromptState {
                 },
                 supported_request.tool_call,
                 supported_request.options,
+                None,
             );
             return Ok(());
         }
@@ -140,6 +179,7 @@ impl PromptState {
                     .raw_input(raw_input),
             ),
             options,
+            None,
         );
         Ok(())
     }
@@ -260,10 +300,11 @@ impl PromptState {
         call_id: String,
         invocation: McpInvocation,
     ) {
-        let title = format!("Tool: {}/{}", invocation.server, invocation.tool);
+        let (title, kind) = mcp_tool_title_and_kind(&invocation);
         self.active_agent_owned_tools.insert(call_id.clone());
         client.send_tool_call(
             ToolCall::new(call_id.clone(), title)
+                .kind(kind)
                 .status(ToolCallStatus::InProgress)
                 .raw_input(serde_json::json!(&invocation))
                 .meta(Some(agent_owned_tool_stop_meta(&call_id))),
@@ -487,6 +528,7 @@ impl PromptState {
                 .into_iter()
                 .map(|option| option.permission_option)
                 .collect(),
+            None,
         );
 
         Ok(())
@@ -914,6 +956,7 @@ impl PromptState {
                 PermissionOption::new("approved", "Yes", PermissionOptionKind::AllowOnce),
                 PermissionOption::new("abort", "No", PermissionOptionKind::RejectOnce),
             ],
+            None,
         );
 
         Ok(())
@@ -936,6 +979,7 @@ impl PromptState {
             turn_id
         };
         let (title, content, options, option_map) = build_user_input_permission_request(&questions);
+        let permission_input_meta = user_input_permission_meta(&questions);
         let content = if content.is_empty() {
             None
         } else {
@@ -968,8 +1012,10 @@ impl PromptState {
                     .title(title)
                     .raw_input(raw_input)
                     .content(content),
-            ),
+            )
+            .meta(Some(permission_input_meta.clone())),
             options,
+            Some(permission_input_meta),
         );
 
         Ok(())
@@ -1036,5 +1082,36 @@ impl PromptState {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mcp_web_tool_titles_use_query_and_url() {
+        let search = McpInvocation {
+            server: "kodex-web-tools".to_string(),
+            tool: "web_search".to_string(),
+            arguments: Some(serde_json::json!({ "query": "rust async dns" })),
+        };
+        let fetch = McpInvocation {
+            server: "kodex-web-tools".to_string(),
+            tool: "web_fetch".to_string(),
+            arguments: Some(serde_json::json!({ "url": "https://example.com/docs" })),
+        };
+
+        assert_eq!(
+            mcp_tool_title_and_kind(&search),
+            ("Search web: rust async dns".to_string(), ToolKind::Search)
+        );
+        assert_eq!(
+            mcp_tool_title_and_kind(&fetch),
+            (
+                "Fetch web: https://example.com/docs".to_string(),
+                ToolKind::Fetch,
+            )
+        );
     }
 }

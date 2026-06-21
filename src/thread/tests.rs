@@ -210,7 +210,11 @@ impl CodexThreadImpl for StubCodexThread {
                     }
                     drop(first_user_message);
 
-                    if prompt.starts_with(SESSION_TITLE_INSTRUCTIONS) {
+                    if prompt == "steer-reject" {
+                        return Err(CodexErr::UnsupportedOperation(
+                            "active turn is not steerable".to_string(),
+                        ));
+                    } else if prompt.starts_with(SESSION_TITLE_INSTRUCTIONS) {
                         let turn_id = id.to_string();
                         let title = "WOA Title Fix".to_string();
                         let send = |msg| {
@@ -655,6 +659,8 @@ impl CodexThreadImpl for StubCodexThread {
                 | Op::RequestPermissionsResponse { .. }
                 | Op::UserInputAnswer { .. }
                 | Op::PatchApproval { .. }
+                | Op::ThreadSettings { .. }
+                | Op::RefreshMcpServers { .. }
                 | Op::Interrupt => {}
                 Op::Shutdown => {
                     if let Some(active_prompt_id) = self.active_prompt_id.lock().unwrap().take() {
