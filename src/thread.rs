@@ -623,6 +623,18 @@ fn agent_owned_tool_stop_meta(tool_call_id: &str) -> Meta {
     )])
 }
 
+fn kodex_usage_meta(total_tokens: u64) -> Meta {
+    Meta::from_iter([(
+        "kodex.ai/usage".to_string(),
+        json!({
+            "scope": "context_snapshot",
+            "agent_cli": "codex-acp",
+            "provider": "openai",
+            "total_tokens": total_tokens,
+        }),
+    )])
+}
+
 fn merge_meta(mut base: Meta, extra: Meta) -> Meta {
     base.extend(extra);
     base

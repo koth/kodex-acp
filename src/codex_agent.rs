@@ -66,6 +66,15 @@ const KODEX_WEB_TOOLS_MCP_SERVER_NAME: &str = "kodex-web-tools";
 const KODEX_FILE_EDITING_DEVELOPER_INSTRUCTIONS: &str = r#"Kodex file editing rule:
 - Do not directly create, overwrite, append, rename, move, or delete files through shell commands, Python/Node scripts, redirection, here-documents, tee, Set-Content, Remove-Item, mv/cp/rm, or similar filesystem-mutating shell commands.
 - Use the apply_patch tool/function for file edits. Shell commands are for read-only inspection or validation unless the user explicitly asks for a shell-based operation."#;
+const KODEX_ENGINEERING_DEVELOPER_RULES: &str = r#"Kodex engineering rules:
+- Do not guess APIs; consult the documentation first.
+- Do not work without clarity; clarify boundaries, constraints, and edge cases upfront.
+- Do not assume business logic; align requirements with humans and record decisions.
+- Do not create new interfaces when existing ones can be reused.
+- Do not skip validation; write test cases before running any code.
+- Do not cross architectural red lines; adhere to established standards and guidelines.
+- Do not pretend to know; admit when you are unsure or don't know.
+- Do not make changes blindly; refactor cautiously and with clear justification."#;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonRpcNotification)]
 #[notification(method = "kodex.ai/tool_stop")]
@@ -76,17 +85,20 @@ struct ToolStopNotification {
 }
 
 fn merge_kodex_developer_instructions(existing: Option<String>) -> Option<String> {
-    match existing {
-        Some(instructions) if instructions.contains(KODEX_FILE_EDITING_DEVELOPER_INSTRUCTIONS) => {
-            Some(instructions)
+    let mut merged = existing.unwrap_or_default().trim_end().to_string();
+    for instructions in [
+        KODEX_FILE_EDITING_DEVELOPER_INSTRUCTIONS,
+        KODEX_ENGINEERING_DEVELOPER_RULES,
+    ] {
+        if merged.contains(instructions) {
+            continue;
         }
-        Some(instructions) if !instructions.trim().is_empty() => Some(format!(
-            "{}\n\n{}",
-            instructions.trim_end(),
-            KODEX_FILE_EDITING_DEVELOPER_INSTRUCTIONS
-        )),
-        _ => Some(KODEX_FILE_EDITING_DEVELOPER_INSTRUCTIONS.to_string()),
+        if !merged.is_empty() {
+            merged.push_str("\n\n");
+        }
+        merged.push_str(instructions);
     }
+    Some(merged)
 }
 
 fn normalize_client_mcp_server_name(name: String) -> String {

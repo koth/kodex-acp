@@ -853,6 +853,20 @@ async fn test_parallel_exec_commands() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn codex_usage_meta_includes_kodex_usage_without_cost() {
+    let meta = kodex_usage_meta(123);
+    let usage = meta
+        .get("kodex.ai/usage")
+        .expect("usage metadata should be present");
+
+    assert_eq!(usage.get("scope").and_then(serde_json::Value::as_str), Some("context_snapshot"));
+    assert_eq!(usage.get("agent_cli").and_then(serde_json::Value::as_str), Some("codex-acp"));
+    assert_eq!(usage.get("provider").and_then(serde_json::Value::as_str), Some("openai"));
+    assert_eq!(usage.get("total_tokens").and_then(serde_json::Value::as_u64), Some(123));
+    assert!(usage.get("cost").is_none());
+}
+
 #[tokio::test]
 async fn stop_tool_interrupts_only_registered_in_flight_tool() -> anyhow::Result<()> {
     let (session_id, client, conversation, message_tx, _handle) = setup().await?;

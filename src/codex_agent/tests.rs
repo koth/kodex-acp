@@ -1,6 +1,7 @@
 use super::InitializeResponse;
 use super::{
-    KODEX_FILE_EDITING_DEVELOPER_INSTRUCTIONS, KODEX_WEB_TOOLS_MCP_SERVER_NAME, ProtocolVersion,
+    KODEX_ENGINEERING_DEVELOPER_RULES, KODEX_FILE_EDITING_DEVELOPER_INSTRUCTIONS,
+    KODEX_WEB_TOOLS_MCP_SERVER_NAME, ProtocolVersion,
     build_agent_capabilities, client_mcp_server_config, distinct_session_title,
     merge_kodex_developer_instructions,
 };
@@ -44,7 +45,9 @@ fn initialize_response_advertises_session_list_capability() {
 fn kodex_developer_instructions_are_added_when_missing() {
     let merged = merge_kodex_developer_instructions(None).expect("instructions");
 
-    assert_eq!(merged, KODEX_FILE_EDITING_DEVELOPER_INSTRUCTIONS);
+    assert!(merged.contains(KODEX_FILE_EDITING_DEVELOPER_INSTRUCTIONS));
+    assert!(merged.contains(KODEX_ENGINEERING_DEVELOPER_RULES));
+    assert!(merged.contains("Do not guess APIs; consult the documentation first."));
 }
 
 #[test]
@@ -54,13 +57,14 @@ fn kodex_developer_instructions_preserve_existing_text() {
 
     assert!(merged.starts_with("Existing rule.\n\n"));
     assert!(merged.contains(KODEX_FILE_EDITING_DEVELOPER_INSTRUCTIONS));
+    assert!(merged.contains(KODEX_ENGINEERING_DEVELOPER_RULES));
 }
 
 #[test]
 fn kodex_developer_instructions_are_not_duplicated() {
     let existing = format!(
-        "Existing rule.\n\n{}",
-        KODEX_FILE_EDITING_DEVELOPER_INSTRUCTIONS
+        "Existing rule.\n\n{}\n\n{}",
+        KODEX_FILE_EDITING_DEVELOPER_INSTRUCTIONS, KODEX_ENGINEERING_DEVELOPER_RULES
     );
 
     let merged = merge_kodex_developer_instructions(Some(existing.clone())).expect("instructions");

@@ -479,10 +479,9 @@ impl PromptState {
                 if let Some(info) = info
                     && let Some(size) = info.model_context_window {
                         let used = info.last_token_usage.tokens_in_context_window().max(0) as u64;
-                        client.send_notification(SessionUpdate::UsageUpdate(UsageUpdate::new(
-                            used,
-                            size as u64,
-                        )));
+                        client.send_notification(SessionUpdate::UsageUpdate(
+                            UsageUpdate::new(used, size as u64).meta(kodex_usage_meta(used)),
+                        ));
                     }
             }
             EventMsg::ItemStarted(ItemStartedEvent {
