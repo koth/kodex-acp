@@ -157,22 +157,24 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     pub(super) fn set_active_model_provider(&mut self, provider: &str) -> Result<(), Error> {
-        if provider == self.config.model_provider_id {
-            return Ok(());
+        match provider_activation_for_request(
+            provider,
+            &self.config.model_provider_id,
+            |candidate| self.config.model_providers.contains_key(candidate),
+        )? {
+            ProviderActivation::KeepCurrent => Ok(()),
+            ProviderActivation::Activate(target) => {
+                let provider_config = self
+                    .config
+                    .model_providers
+                    .get(&target)
+                    .cloned()
+                    .expect("target provider existence is validated by provider_activation_for_request");
+                self.config.model_provider_id = target;
+                self.config.model_provider = provider_config;
+                Ok(())
+            }
         }
-        let provider_config = self
-            .config
-            .model_providers
-            .get(provider)
-            .cloned()
-            .ok_or_else(|| {
-                Error::invalid_params().data(format!(
-                    "Unsupported provider for selected model: {provider}"
-                ))
-            })?;
-        self.config.model_provider_id = provider.to_string();
-        self.config.model_provider = provider_config;
-        Ok(())
     }
 
     pub(super) fn parse_model_id(id: &ModelId) -> Option<(String, ReasoningEffort)> {
@@ -504,5 +506,104 @@ impl<A: Auth> ThreadActor<A> {
                 developer_instructions: None,
             },
         }
+    }
+}
+
+/// Runtime provider id of the local BYOK proxy. All BYOK source providers are served
+/// through this single proxy, which routes to the upstream by decoding the
+/// `kodex-provider/byok/<source>/<model>` slug encoded in the model id.
+const KODEX_BYOK_PROXY_PROVIDER_ID: &str = "byok";
+
+/// The runtime provider a model switch should activate, or whether the current one
+/// should be kept.
+enum ProviderActivation {
+    KeepCurrent,
+    Activate(String),
+}
+
+/// Resolves the runtime provider to use after a model switch that targets
+/// `requested_provider`.
+///
+/// BYOK source providers (e.g. "custom", "timiai") are routing labels encoded in the
+/// model slug and served by the local "byok" proxy rather than standalone codex
+/// providers. A model backed by such a source provider must run behind the "byok"
+/// runtime provider (which decodes the source provider from the slug) regardless of
+/// the provider that was active before, so switching to one re-activates "byok" when
+/// it is not already current. A provider that is neither configured nor served by the
+/// proxy is genuinely unsupported and yields an error.
+fn provider_activation_for_request(
+    requested_provider: &str,
+    current_provider_id: &str,
+    is_provider_configured: impl Fn(&str) -> bool,
+) -> Result<ProviderActivation, Error> {
+    if requested_provider == current_provider_id {
+        return Ok(ProviderActivation::KeepCurrent);
+    }
+    if is_provider_configured(requested_provider) {
+        return Ok(ProviderActivation::Activate(requested_provider.to_string()));
+    }
+    if is_provider_configured(KODEX_BYOK_PROXY_PROVIDER_ID) {
+        return Ok(if current_provider_id == KODEX_BYOK_PROXY_PROVIDER_ID {
+            ProviderActivation::KeepCurrent
+        } else {
+            ProviderActivation::Activate(KODEX_BYOK_PROXY_PROVIDER_ID.to_string())
+        });
+    }
+    Err(Error::invalid_params().data(format!(
+        "Unsupported provider for selected model: {requested_provider}"
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A BYOK deployment always configures the "byok" proxy provider and may also
+    // configure concrete upstream providers (e.g. "timiai") that double as source
+    // providers in the model catalog.
+    fn byok_configured_providers(provider: &str) -> bool {
+        matches!(provider, "byok" | "timiai")
+    }
+
+    #[test]
+    fn keeps_byok_runtime_when_switching_from_byok_to_source_provider() {
+        // from=byok, request=custom (a BYOK source provider not in model_providers)
+        assert!(matches!(
+            provider_activation_for_request("custom", "byok", byok_configured_providers).unwrap(),
+            ProviderActivation::KeepCurrent
+        ));
+    }
+
+    #[test]
+    fn routes_to_byok_proxy_when_switching_from_upstream_to_source_provider() {
+        // from=timiai (upstream runtime), request=custom (source provider served by proxy)
+        assert!(matches!(
+            provider_activation_for_request("custom", "timiai", byok_configured_providers).unwrap(),
+            ProviderActivation::Activate(ref target)
+                if target == KODEX_BYOK_PROXY_PROVIDER_ID
+        ));
+    }
+
+    #[test]
+    fn activates_configured_upstream_provider() {
+        assert!(matches!(
+            provider_activation_for_request("timiai", "byok", byok_configured_providers).unwrap(),
+            ProviderActivation::Activate(ref target) if target == "timiai"
+        ));
+    }
+
+    #[test]
+    fn keeps_current_provider_when_request_matches_current() {
+        assert!(matches!(
+            provider_activation_for_request("timiai", "timiai", byok_configured_providers).unwrap(),
+            ProviderActivation::KeepCurrent
+        ));
+    }
+
+    #[test]
+    fn rejects_unsupported_provider_without_byok_proxy() {
+        // No "byok" proxy configured, and the requested provider is unknown.
+        let configured = |provider: &str| provider == "openai";
+        assert!(provider_activation_for_request("custom", "openai", configured).is_err());
     }
 }
