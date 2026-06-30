@@ -71,9 +71,9 @@ use codex_protocol::{
         PatchApplyUpdatedEvent, ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent,
         ReviewDecision, ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem, SessionSource,
         StreamErrorEvent, TerminalInteractionEvent, ThreadGoalStatus, ThreadGoalUpdatedEvent,
-        ThreadSettingsOverrides, TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent,
-        TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent,
-        WebSearchBeginEvent, WebSearchEndEvent,
+        ThreadSettingsOverrides, TokenCountEvent, TokenUsage, TurnAbortedEvent,
+        TurnCompleteEvent, TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent,
+        WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
     request_permissions::{
         PermissionGrantScope, RequestPermissionProfile, RequestPermissionsEvent,
@@ -93,7 +93,7 @@ use futures::StreamExt;
 use heck::ToTitleCase;
 use itertools::Itertools;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -623,14 +623,49 @@ fn agent_owned_tool_stop_meta(tool_call_id: &str) -> Meta {
     )])
 }
 
-fn kodex_usage_meta(total_tokens: u64) -> Meta {
+/// Build the `kodex.ai/usage` metadata attached to ACP `UsageUpdate` notifications.
+///
+/// `last` is the most recent request's `TokenUsage` (per-turn delta). `total` is the
+/// cumulative session `TokenUsage`. The top-level fields describe `total` (under
+/// `scope: "session_total"`); the nested `turn_delta` object describes `last` so the
+/// Kodex reducer can update both the session total and the per-turn current usage
+/// from a single notification.
+///
+/// Field mapping from Codex → Kodex:
+///   - `input_tokens`            → `input_tokens`
+///   - `cached_input_tokens`     → `cache_read_tokens`
+///   - `output_tokens`           → `output_tokens`
+///   - `reasoning_output_tokens` → `reasoning_tokens`
+///   - `total_tokens`            → `total_tokens`
+///
+/// Codex does not expose a separate cache-creation count, so `cache_write_tokens`
+/// is intentionally absent (set to `null`) on the Kodex side.
+fn kodex_usage_meta(last: &TokenUsage, total: &TokenUsage, _context_window: i64) -> Meta {
+    fn value(usage: &TokenUsage) -> Value {
+        json!({
+            "input_tokens": usage.input_tokens,
+            "cache_read_tokens": usage.cached_input_tokens,
+            "output_tokens": usage.output_tokens,
+            "reasoning_tokens": usage.reasoning_output_tokens,
+            "total_tokens": usage.total_tokens,
+            "cache_write_tokens": Value::Null,
+        })
+    }
+
     Meta::from_iter([(
         "kodex.ai/usage".to_string(),
         json!({
-            "scope": "context_snapshot",
+            "scope": "session_total",
             "agent_cli": "codex-acp",
             "provider": "openai",
-            "total_tokens": total_tokens,
+            "model": Value::Null,
+            "input_tokens": total.input_tokens,
+            "cache_read_tokens": total.cached_input_tokens,
+            "output_tokens": total.output_tokens,
+            "reasoning_tokens": total.reasoning_output_tokens,
+            "total_tokens": total.total_tokens,
+            "cache_write_tokens": Value::Null,
+            "turn_delta": value(last),
         }),
     )])
 }

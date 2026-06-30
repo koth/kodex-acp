@@ -854,17 +854,87 @@ async fn test_parallel_exec_commands() -> anyhow::Result<()> {
 }
 
 #[test]
-fn codex_usage_meta_includes_kodex_usage_without_cost() {
-    let meta = kodex_usage_meta(123);
+fn codex_usage_meta_includes_full_breakdown_without_cost() {
+    use codex_protocol::protocol::TokenUsage;
+
+    let last = TokenUsage {
+        input_tokens: 100,
+        cached_input_tokens: 40,
+        output_tokens: 30,
+        reasoning_output_tokens: 10,
+        total_tokens: 170,
+    };
+    let total = TokenUsage {
+        input_tokens: 500,
+        cached_input_tokens: 200,
+        output_tokens: 150,
+        reasoning_output_tokens: 50,
+        total_tokens: 850,
+    };
+    let meta = kodex_usage_meta(&last, &total, 200_000);
     let usage = meta
         .get("kodex.ai/usage")
         .expect("usage metadata should be present");
 
-    assert_eq!(usage.get("scope").and_then(serde_json::Value::as_str), Some("context_snapshot"));
-    assert_eq!(usage.get("agent_cli").and_then(serde_json::Value::as_str), Some("codex-acp"));
-    assert_eq!(usage.get("provider").and_then(serde_json::Value::as_str), Some("openai"));
-    assert_eq!(usage.get("total_tokens").and_then(serde_json::Value::as_u64), Some(123));
+    // Top-level scope and identity.
+    assert_eq!(
+        usage.get("scope").and_then(serde_json::Value::as_str),
+        Some("session_total")
+    );
+    assert_eq!(
+        usage.get("agent_cli").and_then(serde_json::Value::as_str),
+        Some("codex-acp")
+    );
+    assert_eq!(
+        usage.get("provider").and_then(serde_json::Value::as_str),
+        Some("openai")
+    );
+
+    // Top-level fields describe the cumulative (total) usage.
+    assert_eq!(usage.get("input_tokens").and_then(serde_json::Value::as_i64), Some(500));
+    assert_eq!(
+        usage.get("cache_read_tokens").and_then(serde_json::Value::as_i64),
+        Some(200),
+        "Codex cached_input_tokens must be mapped to cache_read_tokens"
+    );
+    assert_eq!(usage.get("output_tokens").and_then(serde_json::Value::as_i64), Some(150));
+    assert_eq!(
+        usage.get("reasoning_tokens").and_then(serde_json::Value::as_i64),
+        Some(50),
+        "Codex reasoning_output_tokens must be mapped to reasoning_tokens"
+    );
+    assert_eq!(usage.get("total_tokens").and_then(serde_json::Value::as_i64), Some(850));
+    assert!(
+        usage.get("cache_write_tokens").is_some(),
+        "cache_write_tokens key must be present (null) so consumers can detect absence"
+    );
     assert!(usage.get("cost").is_none());
+
+    // Nested turn_delta describes the most recent request.
+    let turn_delta = usage
+        .get("turn_delta")
+        .and_then(serde_json::Value::as_object)
+        .expect("turn_delta sub-object should be present");
+    assert_eq!(
+        turn_delta.get("input_tokens").and_then(serde_json::Value::as_i64),
+        Some(100)
+    );
+    assert_eq!(
+        turn_delta.get("cache_read_tokens").and_then(serde_json::Value::as_i64),
+        Some(40)
+    );
+    assert_eq!(
+        turn_delta.get("output_tokens").and_then(serde_json::Value::as_i64),
+        Some(30)
+    );
+    assert_eq!(
+        turn_delta.get("reasoning_tokens").and_then(serde_json::Value::as_i64),
+        Some(10)
+    );
+    assert_eq!(
+        turn_delta.get("total_tokens").and_then(serde_json::Value::as_i64),
+        Some(170)
+    );
 }
 
 #[tokio::test]
