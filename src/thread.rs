@@ -641,7 +641,14 @@ fn agent_owned_tool_stop_meta(tool_call_id: &str) -> Meta {
 ///
 /// Codex does not expose a separate cache-creation count, so `cache_write_tokens`
 /// is intentionally absent (set to `null`) on the Kodex side.
-fn kodex_usage_meta(last: &TokenUsage, total: &TokenUsage, _context_window: i64) -> Meta {
+fn kodex_usage_meta(
+    last: &TokenUsage,
+    total: &TokenUsage,
+    _context_window: i64,
+    latency_ms: Option<u64>,
+    ttft_ms: Option<u64>,
+    tokens_per_second: Option<f64>,
+) -> Meta {
     fn value(usage: &TokenUsage) -> Value {
         json!({
             "input_tokens": usage.input_tokens,
@@ -653,6 +660,16 @@ fn kodex_usage_meta(last: &TokenUsage, total: &TokenUsage, _context_window: i64)
         })
     }
 
+    let mut turn_delta = value(last);
+    if let Some(latency) = latency_ms {
+        turn_delta["latency_ms"] = json!(latency);
+    }
+    if let Some(ttft) = ttft_ms {
+        turn_delta["ttft_ms"] = json!(ttft);
+    }
+    if let Some(speed) = tokens_per_second {
+        turn_delta["tokens_per_second"] = json!(speed);
+    }
     Meta::from_iter([(
         "kodex.ai/usage".to_string(),
         json!({
@@ -666,7 +683,7 @@ fn kodex_usage_meta(last: &TokenUsage, total: &TokenUsage, _context_window: i64)
             "reasoning_tokens": total.reasoning_output_tokens,
             "total_tokens": total.total_tokens,
             "cache_write_tokens": Value::Null,
-            "turn_delta": value(last),
+            "turn_delta": turn_delta,
         }),
     )])
 }

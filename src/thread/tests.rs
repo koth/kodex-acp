@@ -871,7 +871,7 @@ fn codex_usage_meta_includes_full_breakdown_without_cost() {
         reasoning_output_tokens: 50,
         total_tokens: 850,
     };
-    let meta = kodex_usage_meta(&last, &total, 200_000);
+    let meta = kodex_usage_meta(&last, &total, 200_000, None, None, None);
     let usage = meta
         .get("kodex.ai/usage")
         .expect("usage metadata should be present");

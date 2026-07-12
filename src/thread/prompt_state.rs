@@ -95,6 +95,16 @@ pub(super) struct PromptState {
     seen_reasoning_deltas: bool,
     agent_message_text: String,
     commentary_message_item_ids: HashSet<String>,
+    /// Instant the current model call started — stamped only on the FIRST
+    /// `ItemStarted(AgentMessage)` of a response (commentary + final share
+    /// one model call). Consumed (cleared) by the next `TokenCount`, so a
+    /// subsequent independent model call starts fresh. `None` outside a
+    /// timed call.
+    model_call_start: Option<std::time::Instant>,
+    /// Elapsed time from `model_call_start` to the first output delta
+    /// (commentary or final). Stamped once per call by `stamp_ttft`;
+    /// cleared by `consume_model_call_timing`.
+    model_call_ttft: Option<std::time::Duration>,
 }
 
 impl PromptState {
@@ -131,6 +141,8 @@ impl PromptState {
             seen_reasoning_deltas: false,
             agent_message_text: String::new(),
             commentary_message_item_ids: HashSet::new(),
+            model_call_start: None,
+            model_call_ttft: None,
         }
     }
 
@@ -429,6 +441,48 @@ impl PromptState {
     }
 
     #[expect(clippy::too_many_lines)]
+    /// Stamp TTFT on the first output delta of the current model call.
+    fn stamp_ttft(&mut self) {
+        if self.model_call_ttft.is_none()
+            && let Some(start) = self.model_call_start
+        {
+            self.model_call_ttft = Some(start.elapsed());
+        }
+    }
+
+    /// Consume the current model call's timing, producing
+    /// (latency, ttft, tokens_per_second) for the usage meta. Resets the
+    /// in-flight timing state so the next ItemStarted starts fresh.
+    fn consume_model_call_timing(
+        &mut self,
+        last: &TokenUsage,
+    ) -> (Option<u64>, Option<u64>, Option<f64>) {
+        let Some(start) = self.model_call_start.take() else {
+            self.model_call_ttft = None;
+            return (None, None, None);
+        };
+        let ttft = self.model_call_ttft.take();
+        let latency = start.elapsed();
+        let latency_ms = Some(latency.as_millis() as u64);
+        let ttft_ms = ttft.map(|d| d.as_millis() as u64);
+        let tokens_per_second = {
+            let output = last.output_tokens as f64;
+            if output > 0.0 {
+                let gen_secs = latency
+                    .saturating_sub(ttft.unwrap_or(std::time::Duration::ZERO))
+                    .as_secs_f64();
+                if gen_secs > 0.0 {
+                    Some(output / gen_secs)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        (latency_ms, ttft_ms, tokens_per_second)
+    }
+
     pub(in crate::thread) async fn handle_event(
         &mut self,
         client: &SessionClient,
@@ -479,10 +533,15 @@ impl PromptState {
                 if let Some(info) = info
                     && let Some(size) = info.model_context_window {
                         let used = info.last_token_usage.tokens_in_context_window().max(0) as u64;
+                        let (latency_ms, ttft_ms, tokens_per_second) =
+                            self.consume_model_call_timing(&info.last_token_usage);
                         let meta = kodex_usage_meta(
                             &info.last_token_usage,
                             &info.total_token_usage,
                             size,
+                            latency_ms,
+                            ttft_ms,
+                            tokens_per_second,
                         );
                         client.send_notification(SessionUpdate::UsageUpdate(
                             UsageUpdate::new(used, size as u64).meta(meta),
@@ -497,10 +556,20 @@ impl PromptState {
                 ..
             }) => {
                 info!("Item started with thread_id: {thread_id}, turn_id: {turn_id}, item: {item:?}");
-                if let TurnItem::AgentMessage(message) = &item
-                    && is_commentary_phase(message.phase.as_ref())
-                {
-                    self.commentary_message_item_ids.insert(message.id.clone());
+                if let TurnItem::AgentMessage(message) = &item {
+                    // Stamp the model-call start only on the FIRST
+                    // AgentMessage of a response. Codex emits commentary
+                    // and final as separate items within one model call;
+                    // resetting on the final item would discard the
+                    // commentary segment's TTFT. `consume_model_call_timing`
+                    // clears `model_call_start` after each `TokenCount`, so
+                    // the next independent model call starts fresh.
+                    if self.model_call_start.is_none() {
+                        self.model_call_start = Some(std::time::Instant::now());
+                    }
+                    if is_commentary_phase(message.phase.as_ref()) {
+                        self.commentary_message_item_ids.insert(message.id.clone());
+                    }
                 }
             }
             EventMsg::UserMessage(UserMessageEvent {
@@ -520,6 +589,7 @@ impl PromptState {
                 ..
             }) => {
                 info!("Agent message content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, delta: {delta:?}");
+                self.stamp_ttft();
                 if self.commentary_message_item_ids.contains(&item_id) {
                     self.seen_commentary_message_deltas = true;
                 } else {
@@ -545,6 +615,7 @@ impl PromptState {
                 ..
             }) => {
                 info!("Agent reasoning content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, index: {index}, delta: {delta:?}");
+                self.stamp_ttft();
                 self.seen_reasoning_deltas = true;
                 client.send_agent_thought(delta);
             }
