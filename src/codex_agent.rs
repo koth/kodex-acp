@@ -499,8 +499,18 @@ impl CodexAgent {
     ) -> Result<Config, Error> {
         let mut config = self.config.clone();
         config.cwd = cwd.try_into().map_err(Error::into_internal_error)?;
+        let dbg = format!("[codex-acp] build_session_config model={:?} catalog_loaded={} catalog_models={}\n",
+            config.model,
+            config.model_catalog.is_some(),
+            config.model_catalog.as_ref().map(|c| c.models.len()).unwrap_or(0));
+        let _ = std::fs::OpenOptions::new().create(true).append(true)
+            .open(std::path::Path::new(&std::env::var_os("HOME").unwrap_or_default()).join(".kodex/logs/codex-acp-debug.log"))
+            .and_then(|mut f| std::io::Write::write_all(&mut f, dbg.as_bytes()));
         config.developer_instructions =
             merge_kodex_developer_instructions(config.developer_instructions);
+        config.include_permissions_instructions = false;
+        config.base_instructions =
+            Some(include_str!("codex_agent/base_instructions.md").to_string());
         config
             .features
             .enable(Feature::DefaultModeRequestUserInput)

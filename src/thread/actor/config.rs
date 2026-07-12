@@ -134,7 +134,10 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     pub(super) fn encode_provider_value(value: &str, provider: &str) -> String {
-        if value.starts_with(KODEX_PROVIDER_VALUE_PREFIX) || provider.trim().is_empty() {
+        if value.starts_with(KODEX_PROVIDER_VALUE_PREFIX)
+            || value.starts_with(KODEX_PROVIDER_SLASH_VALUE_PREFIX)
+            || provider.trim().is_empty()
+        {
             value.to_string()
         } else {
             format!("{KODEX_PROVIDER_VALUE_PREFIX}{}:{value}", provider.trim())

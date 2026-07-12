@@ -411,7 +411,12 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn handle_set_model(&mut self, model: ModelId) -> Result<(), Error> {
+        let raw = model.0.to_string();
         let (selected_provider, model_id) = Self::decode_provider_value(model.0.as_ref());
+        let dbg = format!("[codex-acp] handle_set_model raw={} decoded=({}, {})\n", raw, selected_provider.as_deref().unwrap_or("<none>"), model_id);
+        let _ = std::fs::OpenOptions::new().create(true).append(true)
+            .open(std::path::Path::new(&std::env::var_os("HOME").unwrap_or_default()).join(".kodex/logs/codex-acp-debug.log"))
+            .and_then(|mut f| std::io::Write::write_all(&mut f, dbg.as_bytes()));
         if let Some(provider) = selected_provider.as_deref() {
             self.set_active_model_provider(provider)?;
         }
