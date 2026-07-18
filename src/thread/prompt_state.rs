@@ -530,23 +530,34 @@ impl PromptState {
                 info!("Task started with context window of {turn_id} {model_context_window:?} {collaboration_mode_kind:?}");
             }
             EventMsg::TokenCount(TokenCountEvent { info, .. }) => {
-                if let Some(info) = info
-                    && let Some(size) = info.model_context_window {
+                // Always emit a UsageUpdate for every TokenCount — even when
+                // `info` is None or `model_context_window` is missing — so the
+                // request counter in Settings → 用量 counts every model call.
+                // Previously, when a reverse-proxy (codebuddy-proxy) reported
+                // zero/missing usage, `info` was None and no notification was
+                // sent, so the turn was invisible to the request counter
+                // (under-counting: 259 recorded vs 289 actual).
+                let (last, total, size, used) = match info {
+                    Some(info) => {
+                        let size = info.model_context_window.unwrap_or(0);
                         let used = info.last_token_usage.tokens_in_context_window().max(0) as u64;
-                        let (latency_ms, ttft_ms, tokens_per_second) =
-                            self.consume_model_call_timing(&info.last_token_usage);
-                        let meta = kodex_usage_meta(
-                            &info.last_token_usage,
-                            &info.total_token_usage,
-                            size,
-                            latency_ms,
-                            ttft_ms,
-                            tokens_per_second,
-                        );
-                        client.send_notification(SessionUpdate::UsageUpdate(
-                            UsageUpdate::new(used, size as u64).meta(meta),
-                        ));
+                        (info.last_token_usage, info.total_token_usage, size, used)
                     }
+                    None => (TokenUsage::default(), TokenUsage::default(), 0, 0),
+                };
+                let (latency_ms, ttft_ms, tokens_per_second) =
+                    self.consume_model_call_timing(&last);
+                let meta = kodex_usage_meta(
+                    &last,
+                    &total,
+                    size,
+                    latency_ms,
+                    ttft_ms,
+                    tokens_per_second,
+                );
+                client.send_notification(SessionUpdate::UsageUpdate(
+                    UsageUpdate::new(used, size as u64).meta(meta),
+                ));
             }
             EventMsg::ItemStarted(ItemStartedEvent {
                 thread_id,
