@@ -862,14 +862,14 @@ fn codex_usage_meta_includes_full_breakdown_without_cost() {
         cached_input_tokens: 40,
         output_tokens: 30,
         reasoning_output_tokens: 10,
-        total_tokens: 170,
+        total_tokens: 130,
     };
     let total = TokenUsage {
         input_tokens: 500,
         cached_input_tokens: 200,
         output_tokens: 150,
         reasoning_output_tokens: 50,
-        total_tokens: 850,
+        total_tokens: 650,
     };
     let meta = kodex_usage_meta(&last, &total, 200_000, None, None, None);
     let usage = meta
@@ -903,7 +903,7 @@ fn codex_usage_meta_includes_full_breakdown_without_cost() {
         Some(50),
         "Codex reasoning_output_tokens must be mapped to reasoning_tokens"
     );
-    assert_eq!(usage.get("total_tokens").and_then(serde_json::Value::as_i64), Some(850));
+    assert_eq!(usage.get("total_tokens").and_then(serde_json::Value::as_i64), Some(650));
     assert!(
         usage.get("cache_write_tokens").is_some(),
         "cache_write_tokens key must be present (null) so consumers can detect absence"
@@ -931,9 +931,12 @@ fn codex_usage_meta_includes_full_breakdown_without_cost() {
         turn_delta.get("reasoning_tokens").and_then(serde_json::Value::as_i64),
         Some(10)
     );
-    assert_eq!(
-        turn_delta.get("total_tokens").and_then(serde_json::Value::as_i64),
-        Some(170)
+    // Per-call `total_tokens` (full prompt, cache-inclusive) is intentionally
+    // NOT emitted on turn_delta — consumers accumulate `input + output`
+    // instead so the session total is not inflated by the full prompt.
+    assert!(
+        turn_delta.get("total_tokens").is_none(),
+        "turn_delta must not carry total_tokens (full-prompt figure)"
     );
 }
 

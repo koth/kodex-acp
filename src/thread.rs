@@ -637,10 +637,12 @@ fn agent_owned_tool_stop_meta(tool_call_id: &str) -> Meta {
 ///   - `cached_input_tokens`     → `cache_read_tokens`
 ///   - `output_tokens`           → `output_tokens`
 ///   - `reasoning_output_tokens` → `reasoning_tokens`
-///   - `total_tokens`            → `total_tokens`
+///   - `total_tokens`            → `total_tokens` (session_cumulative only)
 ///
 /// Codex does not expose a separate cache-creation count, so `cache_write_tokens`
-/// is intentionally absent (set to `null`) on the Kodex side.
+/// is intentionally absent (set to `null`) on the Kodex side. `total_tokens`
+/// is only emitted on the session-cumulative top level, not on the nested
+/// `turn_delta` — see the note inside `value()`.
 fn kodex_usage_meta(
     last: &TokenUsage,
     total: &TokenUsage,
@@ -655,12 +657,30 @@ fn kodex_usage_meta(
             "cache_read_tokens": usage.cached_input_tokens,
             "output_tokens": usage.output_tokens,
             "reasoning_tokens": usage.reasoning_output_tokens,
-            "total_tokens": usage.total_tokens,
+            // NOTE: `total_tokens` is intentionally absent on the nested
+            // `turn_delta`. Codex's per-call `total_tokens` is the FULL
+            // prompt of that single call (input includes the cached prefix),
+            // not a billable increment — the reducer/store already surface
+            // that as context-window occupancy via `used`. Emitting it as a
+            // turn "total" would make the session-store / reducer accumulate
+            // the full prompt into the session total every request (~2×
+            // inflation for cache-heavy turns). Consumers fall back to
+            // `input + output` for the delta, which is the real per-request
+            // consumption. The session-cumulative `total_tokens` (top level)
+            // is kept because `Σ(input+output)` IS the correct cumulative.
             "cache_write_tokens": Value::Null,
         })
     }
 
+    // Session-cumulative total: Σ(input+output) across the session. Keep on
+    // the top-level scope only (see note in `value`).
+    fn with_total(mut value: Value, total: &TokenUsage) -> Value {
+        value["total_tokens"] = json!(total.total_tokens);
+        value
+    }
+
     let mut turn_delta = value(last);
+    let mut session_fields = with_total(value(total), total);
     if let Some(latency) = latency_ms {
         turn_delta["latency_ms"] = json!(latency);
     }
@@ -670,22 +690,14 @@ fn kodex_usage_meta(
     if let Some(speed) = tokens_per_second {
         turn_delta["tokens_per_second"] = json!(speed);
     }
-    Meta::from_iter([(
-        "kodex.ai/usage".to_string(),
-        json!({
-            "scope": "session_total",
-            "agent_cli": "codex-acp",
-            "provider": "openai",
-            "model": Value::Null,
-            "input_tokens": total.input_tokens,
-            "cache_read_tokens": total.cached_input_tokens,
-            "output_tokens": total.output_tokens,
-            "reasoning_tokens": total.reasoning_output_tokens,
-            "total_tokens": total.total_tokens,
-            "cache_write_tokens": Value::Null,
-            "turn_delta": turn_delta,
-        }),
-    )])
+    if let Some(fields) = session_fields.as_object_mut() {
+        fields.insert("scope".to_string(), json!("session_total"));
+        fields.insert("agent_cli".to_string(), json!("codex-acp"));
+        fields.insert("provider".to_string(), json!("openai"));
+        fields.insert("model".to_string(), Value::Null);
+        fields.insert("turn_delta".to_string(), turn_delta);
+    }
+    Meta::from_iter([("kodex.ai/usage".to_string(), session_fields)])
 }
 
 fn merge_meta(mut base: Meta, extra: Meta) -> Meta {
