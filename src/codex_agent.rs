@@ -65,7 +65,12 @@ const KODEX_TOOL_STOP_METHOD: &str = "kodex.ai/tool_stop";
 const KODEX_WEB_TOOLS_MCP_SERVER_NAME: &str = "kodex-web-tools";
 const KODEX_FILE_EDITING_DEVELOPER_INSTRUCTIONS: &str = r#"File editing rule:
 - Do not directly create, overwrite, append, rename, move, or delete files through shell commands, Python/Node scripts, redirection, here-documents, tee, Set-Content, Remove-Item, mv/cp/rm, or similar filesystem-mutating shell commands.
-- Use the apply_patch tool/function for file edits. Shell commands are for read-only inspection or validation unless the user explicitly asks for a shell-based operation."#;
+- Forbidden file-edit patterns (never use these for source/text edits):
+  - `python` / `python3` / `node` one-liners or heredocs that call `Path(...).write_text`, `write_bytes`, `open(..., "w"|"a"|"x")`, `fs.writeFile`, `fs.writeFileSync`
+  - shell redirection into files (`>`, `>>`, `tee path`)
+  - `sed -i`, `perl -pi`, `ruby -i` in-place edits
+- Use the apply_patch tool/function for ordinary text file create/update/delete. Shell is read-only inspection/validation unless the user explicitly asks for a shell-based mutation.
+- If a previous turn used a script/shell write, stop and redo the remaining edits with apply_patch so changes stay reviewable."#;
 const KODEX_ENGINEERING_DEVELOPER_RULES: &str = r#"Engineering rules:
 - Do not guess APIs; consult the documentation first.
 - Do not work without clarity; clarify boundaries, constraints, and edge cases upfront.
