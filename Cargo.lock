@@ -2646,7 +2646,6 @@ dependencies = [
 [[package]]
 name = "codex-shell-command"
 version = "0.136.0"
-source = "git+https://github.com/openai/codex?tag=rust-v0.136.0#7ca611348db9446711ed16ed81c84095e3721cee"
 dependencies = [
  "base64",
  "codex-protocol",

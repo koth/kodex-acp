@@ -160,6 +160,10 @@ impl SessionTitleGenerator for FailingSessionTitleGenerator {
 struct StubCodexThread {
     current_id: AtomicUsize,
     active_prompt_id: std::sync::Mutex<Option<String>>,
+    // Sub-id of a turn whose exec approval was `Denied`. Codex keeps the
+    // turn alive on `Denied`, so the guidance follow-up steers into it;
+    // model that by completing the original turn when the guidance arrives.
+    denied_approval_turn: std::sync::Mutex<Option<String>>,
     thread_name: std::sync::Mutex<Option<String>>,
     first_user_message: std::sync::Mutex<Option<String>>,
     ops: std::sync::Mutex<Vec<Op>>,
@@ -173,6 +177,7 @@ impl StubCodexThread {
         StubCodexThread {
             current_id: AtomicUsize::new(0),
             active_prompt_id: std::sync::Mutex::default(),
+            denied_approval_turn: std::sync::Mutex::default(),
             thread_name: std::sync::Mutex::default(),
             first_user_message: std::sync::Mutex::default(),
             ops: std::sync::Mutex::default(),
@@ -196,6 +201,27 @@ impl CodexThreadImpl for StubCodexThread {
 
             match op {
                 Op::UserInput { items, .. } => {
+                    // If a turn was denied approval, model the guidance
+                    // steering into the active turn and completing the
+                    // original prompt (codex `steer_input`): the follow-up
+                    // runs in the same turn instead of spawning a new one.
+                    if let Some(denied_turn) =
+                        self.denied_approval_turn.lock().unwrap().take()
+                    {
+                        self.op_tx
+                            .send(Event {
+                                id: denied_turn.clone(),
+                                msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                                    last_agent_message: None,
+                                    turn_id: denied_turn,
+                                    completed_at: None,
+                                    duration_ms: None,
+                                    time_to_first_token_ms: None,
+                                }),
+                            })
+                            .unwrap();
+                        return Ok(id.to_string());
+                    }
                     *self.active_prompt_id.lock().unwrap() = Some(id.to_string());
                     let prompt = items
                         .into_iter()
@@ -525,6 +551,22 @@ impl CodexThreadImpl for StubCodexThread {
                                 }),
                             })
                             .unwrap();
+                    } else if prompt == "patch-approval-block" {
+                        self.op_tx
+                            .send(Event {
+                                id: id.to_string(),
+                                msg: EventMsg::ApplyPatchApprovalRequest(
+                                    ApplyPatchApprovalRequestEvent {
+                                        call_id: "approval-id".to_string(),
+                                        turn_id: id.to_string(),
+                                        started_at_ms: 0,
+                                        changes: HashMap::new(),
+                                        reason: None,
+                                        grant_root: None,
+                                    },
+                                ),
+                            })
+                            .unwrap();
                     } else {
                         self.op_tx
                             .send(Event {
@@ -654,11 +696,30 @@ impl CodexThreadImpl for StubCodexThread {
                         })
                         .unwrap();
                 }
-                Op::ExecApproval { .. }
-                | Op::ResolveElicitation { .. }
+                Op::ExecApproval { decision, .. } => {
+                    // `Denied` keeps the turn alive (codex
+                    // `notify_approval`); remember the active turn so the
+                    // guidance follow-up can model steering into it.
+                    if matches!(decision, ReviewDecision::Denied)
+                        && let Some(active) =
+                            self.active_prompt_id.lock().unwrap().take()
+                    {
+                        *self.denied_approval_turn.lock().unwrap() = Some(active);
+                    }
+                }
+                Op::PatchApproval { decision, .. } => {
+                    // `Denied` keeps the turn alive (codex
+                    // `notify_approval`); same as `ExecApproval` above.
+                    if matches!(decision, ReviewDecision::Denied)
+                        && let Some(active) =
+                            self.active_prompt_id.lock().unwrap().take()
+                    {
+                        *self.denied_approval_turn.lock().unwrap() = Some(active);
+                    }
+                }
+                Op::ResolveElicitation { .. }
                 | Op::RequestPermissionsResponse { .. }
                 | Op::UserInputAnswer { .. }
-                | Op::PatchApproval { .. }
                 | Op::ThreadSettings { .. }
                 | Op::RefreshMcpServers { .. }
                 | Op::Interrupt => {}

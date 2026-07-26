@@ -167,3 +167,61 @@ pub use codex_mcp_server::{
     CodexToolCallParam, CodexToolCallReplyParam, ExecApprovalElicitRequestParams,
     ExecApprovalResponse, PatchApprovalElicitRequestParams, PatchApprovalResponse,
 };
+
+#[cfg(test)]
+mod tests_shell_safety {
+    //! The vendored `codex-shell-command` patch routes shell file-write
+    //! commands to the host permission broker. These cover the argv shapes
+    //! that `commands_for_exec_policy` actually feeds to
+    //! `command_might_be_dangerous` after heredoc/redirect parsing.
+    use codex_shell_command::is_dangerous_command::command_might_be_dangerous;
+
+    fn argv(items: &[&str]) -> Vec<String> {
+        items.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn python_stdin_heredoc_routes_to_broker() {
+        // `python3 - <<'PY' ... Path(...).write_text(...) ... PY` parses down
+        // to `["python3", "-"]` (the heredoc body is stripped); this must be
+        // routed to the broker, which sees the full body.
+        assert!(command_might_be_dangerous(&argv(&["python3", "-"])));
+        assert!(command_might_be_dangerous(&argv(&["python", "-"])));
+    }
+
+    #[test]
+    fn python_inline_script_routes_to_broker() {
+        assert!(command_might_be_dangerous(&argv(&["python3", "-c", "print(1)"])));
+        assert!(command_might_be_dangerous(&argv(&["node", "-e", "console.log(1)"])));
+    }
+
+    #[test]
+    fn python_running_a_script_file_is_not_routed() {
+        assert!(!command_might_be_dangerous(&argv(&["python3", "scripts/build.py"])));
+    }
+
+    #[test]
+    fn shell_redirection_routes_to_broker() {
+        assert!(command_might_be_dangerous(&argv(&[
+            "/bin/zsh", "-lc", "echo hi > src/main.rs"
+        ])));
+        assert!(!command_might_be_dangerous(&argv(&["ls", "2>", "/dev/null"])));
+    }
+
+    #[test]
+    fn file_mutation_primitives_route_to_broker() {
+        assert!(command_might_be_dangerous(&argv(&["tee", "file.txt"])));
+        assert!(command_might_be_dangerous(&argv(&["sed", "-i", "s/a/b/", "file.rs"])));
+        assert!(!command_might_be_dangerous(&argv(&["sed", "s/a/b/", "file.rs"])));
+    }
+
+    #[test]
+    fn apply_patch_and_benign_commands_are_not_routed() {
+        assert!(!command_might_be_dangerous(&argv(&[
+            "apply_patch", "<<'PATCH'", "*** Begin Patch", "*** End Patch", "PATCH"
+        ])));
+        assert!(!command_might_be_dangerous(&argv(&["cargo", "build"])));
+        assert!(!command_might_be_dangerous(&argv(&["rg", "foo", "src"])));
+        assert!(!command_might_be_dangerous(&argv(&["git", "status"])));
+    }
+}

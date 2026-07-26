@@ -755,7 +755,7 @@ async fn test_detached_permission_request_drains_late_response() -> anyhow::Resu
 }
 
 #[tokio::test]
-async fn permission_abort_guidance_submits_followup_prompt() -> anyhow::Result<()> {
+async fn permission_abort_guidance_denies_and_steers_into_turn() -> anyhow::Result<()> {
     let session_id = SessionId::new("test");
     let client = Arc::new(StubClient::with_permission_responses(vec![
         RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
@@ -798,7 +798,7 @@ async fn permission_abort_guidance_submits_followup_prompt() -> anyhow::Result<(
         request: PromptRequest::new(session_id, vec!["approval-block".into()]),
         response_tx: prompt_response_tx,
     })?;
-    let _stop_reason_rx = prompt_response_rx.await??;
+    let stop_reason_rx = prompt_response_rx.await??;
 
     tokio::time::timeout(Duration::from_millis(100), async {
         loop {
@@ -810,22 +810,119 @@ async fn permission_abort_guidance_submits_followup_prompt() -> anyhow::Result<(
     })
     .await?;
 
-    let ops = conversation.ops.lock().unwrap();
-    assert!(matches!(
-        ops.get(1),
-        Some(Op::ExecApproval {
-            id,
-            turn_id: Some(_),
-            decision: ReviewDecision::Abort,
-        }) if id == "approval-id"
-    ));
-    assert!(matches!(
-        ops.get(2),
-        Some(Op::UserInput { items, .. })
-            if prompt_text_from_items(items)
-                .as_deref()
-                == Some("Explain the command first and avoid deleting files.")
-    ));
+    {
+        let ops = conversation.ops.lock().unwrap();
+        assert!(matches!(
+            ops.get(1),
+            Some(Op::ExecApproval {
+                id,
+                turn_id: Some(_),
+                // Abort+guidance is downgraded to `Denied` so codex keeps the
+                // turn alive; the guidance then steers into the same turn.
+                decision: ReviewDecision::Denied,
+            }) if id == "approval-id"
+        ));
+        assert!(matches!(
+            ops.get(2),
+            Some(Op::UserInput { items, .. })
+                if prompt_text_from_items(items)
+                    .as_deref()
+                    == Some("Explain the command first and avoid deleting files.")
+        ));
+    }
+
+    // The command is denied (not aborted), so codex keeps the turn alive;
+    // the guidance steers into the same turn, which then completes and
+    // resolves the original ACP `session/prompt` with `EndTurn` — the loop
+    // does not terminate on `Cancelled` and the guidance is not orphaned.
+    let stop_reason = tokio::time::timeout(Duration::from_millis(500), stop_reason_rx).await??;
+    assert_eq!(stop_reason?, StopReason::EndTurn);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn permission_patch_reject_with_guidance_denies_and_steers_into_turn() -> anyhow::Result<()> {
+    let session_id = SessionId::new("test");
+    let client = Arc::new(StubClient::with_permission_responses(vec![
+        RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+            SelectedPermissionOutcome::new("abort"),
+        ))
+        .meta(Meta::from_iter([(
+            KODEX_PERMISSION_GUIDANCE_META_KEY.to_string(),
+            json!("Apply the patch in smaller steps."),
+        )])),
+    ]));
+    let session_client =
+        SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
+    let conversation = Arc::new(StubCodexThread::new());
+    let models_manager = Arc::new(StubModelsManager);
+    let config =
+        Config::load_with_cli_overrides_and_harness_overrides(vec![], ConfigOverrides::default())
+            .await?;
+    let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
+    let actor = ThreadActor::new(
+        StubAuth,
+        session_client,
+        conversation.clone(),
+        models_manager,
+        config,
+        None,
+        message_rx,
+        resolution_tx,
+        resolution_rx,
+    );
+    let handle = tokio::spawn(actor.spawn());
+    let thread = Thread {
+        thread: conversation.clone(),
+        message_tx,
+        _handle: handle,
+    };
+
+    let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+    thread.message_tx.send(ThreadMessage::Prompt {
+        request: PromptRequest::new(session_id, vec!["patch-approval-block".into()]),
+        response_tx: prompt_response_tx,
+    })?;
+    let stop_reason_rx = prompt_response_rx.await??;
+
+    tokio::time::timeout(Duration::from_millis(100), async {
+        loop {
+            if conversation.ops.lock().unwrap().len() >= 3 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+
+    {
+        let ops = conversation.ops.lock().unwrap();
+        // The "No, provide feedback" option (`abort`) with guidance is
+        // downgraded to `Denied` so codex keeps the turn alive; the guidance
+        // then steers into the same turn (verified via `EndTurn` below).
+        assert!(matches!(
+            ops.get(1),
+            Some(Op::PatchApproval {
+                id,
+                decision: ReviewDecision::Denied,
+            }) if id == "approval-id"
+        ));
+        assert!(matches!(
+            ops.get(2),
+            Some(Op::UserInput { items, .. })
+                if prompt_text_from_items(items)
+                    .as_deref()
+                    == Some("Apply the patch in smaller steps.")
+        ));
+    }
+
+    // Same as the exec case: the patch is denied (not aborted), so codex
+    // keeps the turn alive; the guidance steers into it and the original
+    // ACP `session/prompt` resolves with `EndTurn` instead of `Cancelled`.
+    let stop_reason = tokio::time::timeout(Duration::from_millis(500), stop_reason_rx).await??;
+    assert_eq!(stop_reason?, StopReason::EndTurn);
 
     Ok(())
 }

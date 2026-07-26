@@ -305,7 +305,7 @@ impl PromptState {
                 turn_id,
                 option_map,
             } => {
-                let decision = match response.outcome {
+                let selected_decision = match response.outcome {
                     RequestPermissionOutcome::Selected(SelectedPermissionOutcome {
                         option_id,
                         ..
@@ -315,22 +315,41 @@ impl PromptState {
                         .unwrap_or(ReviewDecision::Abort),
                     RequestPermissionOutcome::Cancelled | _ => ReviewDecision::Abort,
                 };
+
+                // The "reject with guidance" option (`Abort`) ends the turn
+                // via codex `interrupt_task`, which resolves the ACP
+                // `session/prompt` with `Cancelled` and terminates the loop
+                // before the guidance can be applied. When the user supplied
+                // guidance, deny the command instead: codex
+                // `notify_approval(Denied)` keeps the turn alive, so the
+                // guidance follow-up steers into the active turn and the
+                // original prompt resolves with `EndTurn` when the steered
+                // turn completes. Without guidance, keep `Abort` so a bare
+                // reject still ends the turn.
+                let submitted_decision =
+                    if matches!(selected_decision, ReviewDecision::Abort)
+                        && permission_guidance.is_some()
+                    {
+                        ReviewDecision::Denied
+                    } else {
+                        selected_decision.clone()
+                    };
 
                 self.thread
                     .submit(Op::ExecApproval {
                         id: approval_id,
                         turn_id: Some(turn_id),
-                        decision: decision.clone(),
+                        decision: submitted_decision,
                     })
                     .await
                     .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
-                Ok(permission_guidance_followup(&decision, permission_guidance))
+                Ok(permission_guidance_followup(&selected_decision, permission_guidance))
             }
             PendingPermissionRequest::Patch {
                 call_id,
                 option_map,
             } => {
-                let decision = match response.outcome {
+                let selected_decision = match response.outcome {
                     RequestPermissionOutcome::Selected(SelectedPermissionOutcome {
                         option_id,
                         ..
@@ -340,15 +359,27 @@ impl PromptState {
                         .unwrap_or(ReviewDecision::Abort),
                     RequestPermissionOutcome::Cancelled | _ => ReviewDecision::Abort,
                 };
+                // Same as the `Exec` arm above: `Abort` would end the turn
+                // via codex `interrupt_task` and orphan the guidance, so
+                // deny the patch instead — `notify_approval(Denied)` keeps
+                // the turn alive and the guidance steers into it.
+                let submitted_decision =
+                    if matches!(selected_decision, ReviewDecision::Abort)
+                        && permission_guidance.is_some()
+                    {
+                        ReviewDecision::Denied
+                    } else {
+                        selected_decision.clone()
+                    };
 
                 self.thread
                     .submit(Op::PatchApproval {
                         id: call_id,
-                        decision: decision.clone(),
+                        decision: submitted_decision,
                     })
                     .await
                     .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
-                Ok(permission_guidance_followup(&decision, permission_guidance))
+                Ok(permission_guidance_followup(&selected_decision, permission_guidance))
             }
             PendingPermissionRequest::RequestPermissions {
                 call_id,
