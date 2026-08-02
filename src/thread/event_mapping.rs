@@ -295,9 +295,9 @@ fn format_file_system_special(value: &FileSystemSpecialPath) -> String {
     }
 }
 
-fn format_file_system_subpath(base: &str, subpath: Option<&Path>) -> String {
+fn format_file_system_subpath(base: &str, subpath: Option<&str>) -> String {
     match subpath {
-        Some(subpath) => format!("{base}/{}", subpath.display()),
+        Some(subpath) => format!("{base}/{subpath}"),
         None => base.to_string(),
     }
 }

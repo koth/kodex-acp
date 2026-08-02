@@ -198,7 +198,6 @@ impl<A: Auth> ThreadActor<A> {
 
     async fn handle_load(&mut self) -> Result<LoadSessionResponse, Error> {
         Ok(LoadSessionResponse::new()
-            .models(self.models().await?)
             .modes(self.modes())
             .config_options(self.config_options().await?))
     }
@@ -226,8 +225,7 @@ impl<A: Auth> ThreadActor<A> {
                             text_elements: vec![],
                         }],
                         final_output_json_schema: None,
-                        environments: None,
-                        responsesapi_client_metadata: None,
+                                                responsesapi_client_metadata: None,
                         additional_context: Default::default(),
                         thread_settings: Default::default(),
                     }
@@ -280,8 +278,7 @@ impl<A: Auth> ThreadActor<A> {
                     op = Op::UserInput {
                         items,
                         final_output_json_schema: None,
-                        environments: None,
-                        responsesapi_client_metadata: None,
+                                                responsesapi_client_metadata: None,
                         additional_context: Default::default(),
                         thread_settings: Default::default(),
                     }
@@ -291,8 +288,7 @@ impl<A: Auth> ThreadActor<A> {
             op = Op::UserInput {
                 items,
                 final_output_json_schema: None,
-                environments: None,
-                responsesapi_client_metadata: None,
+                                responsesapi_client_metadata: None,
                 additional_context: Default::default(),
                 thread_settings: Default::default(),
             }
@@ -338,8 +334,7 @@ impl<A: Auth> ThreadActor<A> {
             .submit(Op::UserInput {
                 items: items.clone(),
                 final_output_json_schema: None,
-                environments: None,
-                responsesapi_client_metadata: None,
+                                responsesapi_client_metadata: None,
                 additional_context: Default::default(),
                 thread_settings: Default::default(),
             })
@@ -433,7 +428,7 @@ impl<A: Auth> ThreadActor<A> {
                 } else {
                     self.get_current_model().await
                 };
-                (fallback, self.config.model_reasoning_effort)
+                (fallback, self.config.model_reasoning_effort.clone())
             };
 
         if model_to_use.is_empty() {
@@ -444,7 +439,7 @@ impl<A: Auth> ThreadActor<A> {
             .submit(Op::ThreadSettings {
                 thread_settings: ThreadSettingsOverrides {
                     model: Some(model_to_use.clone()),
-                    effort: Some(effort_to_use),
+                    effort: Some(effort_to_use.clone()),
                     ..Default::default()
                 },
             })
@@ -719,7 +714,9 @@ impl<A: Auth> ThreadActor<A> {
                     serde_json::from_str(arguments).ok(),
                 );
             }
-            ResponseItem::FunctionCallOutput { call_id, output } => {
+            ResponseItem::FunctionCallOutput {
+                call_id, output, ..
+            } => {
                 self.client
                     .send_tool_call_completed(call_id.clone(), serde_json::to_value(output).ok());
             }
@@ -795,13 +792,14 @@ impl<A: Auth> ThreadActor<A> {
                 name: _,
                 call_id,
                 output,
+                ..
             } => {
                 self.client
                     .send_tool_call_completed(call_id.clone(), Some(serde_json::json!(output)));
             }
             ResponseItem::WebSearchCall { id, action, .. } => {
                 let (title, call_id) = if let Some(action) = action {
-                    web_search_action_to_title_and_id(id, action)
+                    web_search_action_to_title_and_id(&id.clone().map(|x| x.to_string()), action)
                 } else {
                     ("Web Search".into(), generate_fallback_id("web_search"))
                 };
@@ -816,9 +814,13 @@ impl<A: Auth> ThreadActor<A> {
                 status,
                 revised_prompt,
                 result,
+                ..
             } => {
                 self.client.send_tool_call(
-                    ToolCall::new(id.clone(), "Image generation")
+                    ToolCall::new(
+                        id.as_ref().map(|x| x.to_string()).unwrap_or_default(),
+                        "Image generation",
+                    )
                         .kind(ToolKind::Other)
                         .status(image_generation_tool_status(status))
                         .content(image_generation_content(

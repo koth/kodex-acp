@@ -660,14 +660,16 @@ pub(super) fn build_exec_permission_options(
                     },
                 }
             }
-            ReviewDecision::Denied => ExecPermissionOption {
+            ReviewDecision::Denied { .. } => ExecPermissionOption {
                 option_id: "denied",
                 permission_option: PermissionOption::new(
                     "denied",
                     "No, continue without running it",
                     PermissionOptionKind::RejectOnce,
                 ),
-                decision: ReviewDecision::Denied,
+                decision: ReviewDecision::Denied {
+                    rejection: "denied".to_string(),
+                },
             },
             ReviewDecision::Abort => ExecPermissionOption {
                 option_id: "abort",

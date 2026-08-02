@@ -28,6 +28,9 @@ async fn test_exec_approval_uses_available_decisions() -> anyhow::Result<()> {
         &session_client,
         ExecApprovalRequestEvent {
             call_id: "call-id".to_string(),
+            environment_id: None,
+            plugin_id: None,
+            script_path: None,
             approval_id: Some("approval-id".to_string()),
             turn_id: "turn-id".to_string(),
             started_at_ms: 0,
@@ -38,7 +41,12 @@ async fn test_exec_approval_uses_available_decisions() -> anyhow::Result<()> {
             proposed_execpolicy_amendment: None,
             proposed_network_policy_amendments: None,
             additional_permissions: None,
-            available_decisions: Some(vec![ReviewDecision::Approved, ReviewDecision::Denied]),
+            available_decisions: Some(vec![
+                ReviewDecision::Approved,
+                ReviewDecision::Denied {
+                    rejection: "denied".to_string(),
+                },
+            ]),
             parsed_cmd: vec![ParsedCommand::Unknown {
                 cmd: "echo hi".to_string(),
             }],
@@ -74,7 +82,9 @@ async fn test_exec_approval_uses_available_decisions() -> anyhow::Result<()> {
         Some(Op::ExecApproval {
             id,
             turn_id,
-            decision: ReviewDecision::Denied,
+            decision: ReviewDecision::Denied {
+                ..
+            },
         }) if id == "approval-id" && turn_id.as_deref() == Some("turn-id")
     ));
 
@@ -228,6 +238,7 @@ async fn test_request_user_input_routes_to_permission_request() -> anyhow::Resul
             EventMsg::RequestUserInput(RequestUserInputEvent {
                 call_id: "call-user-input".to_string(),
                 turn_id: "turn-id".to_string(),
+                auto_resolution_ms: None,
                 questions: vec![RequestUserInputQuestion {
                     id: "approach".to_string(),
                     header: "Approach".to_string(),
@@ -366,6 +377,7 @@ async fn test_request_user_input_custom_answer_uses_permission_guidance() -> any
             EventMsg::RequestUserInput(RequestUserInputEvent {
                 call_id: "call-custom-input".to_string(),
                 turn_id: "turn-id".to_string(),
+                auto_resolution_ms: None,
                 questions: vec![RequestUserInputQuestion {
                     id: "guidance".to_string(),
                     header: "Guidance".to_string(),
@@ -448,6 +460,7 @@ async fn test_request_user_input_uses_structured_permission_answers() -> anyhow:
             EventMsg::RequestUserInput(RequestUserInputEvent {
                 call_id: "call-user-input".to_string(),
                 turn_id: "turn-id".to_string(),
+                auto_resolution_ms: None,
                 questions: vec![
                     RequestUserInputQuestion {
                         id: "approach".to_string(),
@@ -619,6 +632,9 @@ async fn test_blocked_approval_does_not_block_followup_events() -> anyhow::Resul
             &session_client,
             EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
                 call_id: "call-id".to_string(),
+                environment_id: None,
+                plugin_id: None,
+                script_path: None,
                 approval_id: Some("approval-id".to_string()),
                 turn_id: "turn-id".to_string(),
                 started_at_ms: 0,
@@ -697,6 +713,9 @@ async fn test_detached_permission_request_drains_late_response() -> anyhow::Resu
             &session_client,
             EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
                 call_id: "call-id".to_string(),
+                environment_id: None,
+                plugin_id: None,
+                script_path: None,
                 approval_id: Some("approval-id".to_string()),
                 turn_id: "turn-id".to_string(),
                 started_at_ms: 0,
@@ -819,7 +838,7 @@ async fn permission_abort_guidance_denies_and_steers_into_turn() -> anyhow::Resu
                 turn_id: Some(_),
                 // Abort+guidance is downgraded to `Denied` so codex keeps the
                 // turn alive; the guidance then steers into the same turn.
-                decision: ReviewDecision::Denied,
+                decision: ReviewDecision::Denied { .. },
             }) if id == "approval-id"
         ));
         assert!(matches!(
@@ -906,7 +925,7 @@ async fn permission_patch_reject_with_guidance_denies_and_steers_into_turn() -> 
             ops.get(1),
             Some(Op::PatchApproval {
                 id,
-                decision: ReviewDecision::Denied,
+                decision: ReviewDecision::Denied { .. },
             }) if id == "approval-id"
         ));
         assert!(matches!(

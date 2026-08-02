@@ -77,13 +77,14 @@ impl<A: Auth> ThreadActor<A> {
         let effort = self
             .config
             .model_reasoning_effort
+            .clone()
             .and_then(|effort| {
                 preset
                     .supported_reasoning_efforts
                     .iter()
-                    .find_map(|e| (e.effort == effort).then_some(effort))
+                    .find_map(|e| (e.effort == effort).then_some(effort.clone()))
             })
-            .unwrap_or(preset.default_reasoning_effort);
+            .unwrap_or(preset.default_reasoning_effort.clone());
 
         Some(Self::model_id_for_provider(&preset.id, effort, &provider))
     }
@@ -276,12 +277,13 @@ impl<A: Auth> ThreadActor<A> {
             let current_effort = self
                 .config
                 .model_reasoning_effort
+                .clone()
                 .and_then(|effort| {
                     supported
                         .iter()
-                        .find_map(|e| (e.effort == effort).then_some(effort))
+                        .find_map(|e| (e.effort == effort).then_some(effort.clone()))
                 })
-                .unwrap_or(preset.default_reasoning_effort);
+                .unwrap_or(preset.default_reasoning_effort.clone());
 
             let effort_select_options = supported
                 .iter()
@@ -365,7 +367,7 @@ impl<A: Auth> ThreadActor<A> {
         }
 
         let effort_to_use = if let Some(preset) = preset {
-            if let Some(effort) = self.config.model_reasoning_effort
+            if let Some(effort) = self.config.model_reasoning_effort.clone()
                 && preset
                     .supported_reasoning_efforts
                     .iter()
@@ -373,19 +375,19 @@ impl<A: Auth> ThreadActor<A> {
             {
                 Some(effort)
             } else {
-                Some(preset.default_reasoning_effort)
+                Some(preset.default_reasoning_effort.clone())
             }
         } else {
             // If the user selected a raw model string (not a known preset), don't invent a default.
             // Keep whatever was previously configured (or leave unset) so Codex can decide.
-            self.config.model_reasoning_effort
+            self.config.model_reasoning_effort.clone()
         };
 
         self.thread
             .submit(Op::ThreadSettings {
                 thread_settings: ThreadSettingsOverrides {
                     model: Some(model_to_use.clone()),
-                    effort: Some(effort_to_use),
+                    effort: Some(effort_to_use.clone()),
                     ..Default::default()
                 },
             })
@@ -425,7 +427,7 @@ impl<A: Auth> ThreadActor<A> {
         self.thread
             .submit(Op::ThreadSettings {
                 thread_settings: ThreadSettingsOverrides {
-                    effort: Some(Some(effort)),
+                    effort: Some(Some(effort.clone())),
                     ..Default::default()
                 },
             })
@@ -479,7 +481,11 @@ impl<A: Auth> ThreadActor<A> {
                         .iter()
                         .map(|effort| {
                             ModelInfo::new(
-                                Self::model_id_for_provider(&preset.id, effort.effort, &provider),
+                                Self::model_id_for_provider(
+                                    &preset.id,
+                                    effort.effort.clone(),
+                                    &provider,
+                                ),
                                 format!("{} ({})", preset.display_name, effort.effort),
                             )
                             .description(format!("{} {}", preset.description, effort.description))
@@ -505,7 +511,7 @@ impl<A: Auth> ThreadActor<A> {
             mode,
             settings: Settings {
                 model: self.get_current_model().await,
-                reasoning_effort: self.config.model_reasoning_effort,
+                reasoning_effort: self.config.model_reasoning_effort.clone(),
                 developer_instructions: None,
             },
         }

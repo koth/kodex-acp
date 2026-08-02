@@ -4,11 +4,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use agent_client_protocol::schema::{RequestPermissionResponse, TextContent};
+use agent_client_protocol::schema::v1::{RequestPermissionResponse, TextContent};
 use codex_core::{config::ConfigOverrides, test_support::all_model_presets};
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::items::AgentMessageItem;
 use codex_protocol::{ThreadId, protocol::ThreadGoal};
+use codex_config::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 use tokio::sync::{Mutex, Notify, mpsc::UnboundedSender};
 
 use super::event_mapping::guardian_action_summary;
@@ -214,6 +216,8 @@ impl CodexThreadImpl for StubCodexThread {
                                 msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                     last_agent_message: None,
                                     turn_id: denied_turn,
+                                    error: None,
+                                    started_at: None,
                                     completed_at: None,
                                     duration_ms: None,
                                     time_to_first_token_ms: None,
@@ -262,6 +266,8 @@ impl CodexThreadImpl for StubCodexThread {
                         send(EventMsg::TurnComplete(TurnCompleteEvent {
                             last_agent_message: Some(title),
                             turn_id,
+                            error: None,
+                            started_at: None,
                             completed_at: None,
                             duration_ms: None,
                             time_to_first_token_ms: None,
@@ -280,10 +286,12 @@ impl CodexThreadImpl for StubCodexThread {
                         };
                         send(EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
                             call_id: "call-a".into(),
+                            plugin_id: None,
+                            script_path: None,
                             process_id: None,
                             turn_id: turn_id.clone(),
                             command: vec!["echo".into(), "a".into()],
-                            cwd: cwd.clone().try_into()?,
+                            cwd: PathUri::from(AbsolutePathBuf::try_from(cwd.as_path())?),
                             parsed_cmd: vec![ParsedCommand::Unknown {
                                 cmd: "echo a".into(),
                             }],
@@ -293,10 +301,12 @@ impl CodexThreadImpl for StubCodexThread {
                         }));
                         send(EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
                             call_id: "call-b".into(),
+                            plugin_id: None,
+                            script_path: None,
                             process_id: None,
                             turn_id: turn_id.clone(),
                             command: vec!["echo".into(), "b".into()],
-                            cwd: cwd.clone().try_into()?,
+                            cwd: PathUri::from(AbsolutePathBuf::try_from(cwd.as_path())?),
                             parsed_cmd: vec![ParsedCommand::Unknown {
                                 cmd: "echo b".into(),
                             }],
@@ -306,10 +316,12 @@ impl CodexThreadImpl for StubCodexThread {
                         }));
                         send(EventMsg::ExecCommandEnd(ExecCommandEndEvent {
                             call_id: "call-a".into(),
+                            plugin_id: None,
+                            script_path: None,
                             process_id: None,
                             turn_id: turn_id.clone(),
                             command: vec!["echo".into(), "a".into()],
-                            cwd: cwd.clone().try_into()?,
+                            cwd: PathUri::from(AbsolutePathBuf::try_from(cwd.as_path())?),
                             parsed_cmd: vec![],
                             source: Default::default(),
                             interaction_input: None,
@@ -324,10 +336,12 @@ impl CodexThreadImpl for StubCodexThread {
                         }));
                         send(EventMsg::ExecCommandEnd(ExecCommandEndEvent {
                             call_id: "call-b".into(),
+                            plugin_id: None,
+                            script_path: None,
                             process_id: None,
                             turn_id: turn_id.clone(),
                             command: vec!["echo".into(), "b".into()],
-                            cwd: cwd.clone().try_into()?,
+                            cwd: PathUri::from(AbsolutePathBuf::try_from(cwd.as_path())?),
                             parsed_cmd: vec![],
                             source: Default::default(),
                             interaction_input: None,
@@ -343,6 +357,8 @@ impl CodexThreadImpl for StubCodexThread {
                         send(EventMsg::TurnComplete(TurnCompleteEvent {
                             last_agent_message: None,
                             turn_id,
+                            error: None,
+                            started_at: None,
                             completed_at: None,
                             duration_ms: None,
                             time_to_first_token_ms: None,
@@ -355,10 +371,12 @@ impl CodexThreadImpl for StubCodexThread {
                                 id: id.to_string(),
                                 msg: EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
                                     call_id: "call-long".into(),
+                                    plugin_id: None,
+                                    script_path: None,
                                     process_id: None,
                                     turn_id,
                                     command: vec!["sleep".into(), "60".into()],
-                                    cwd: cwd.try_into()?,
+                                    cwd: PathUri::from(AbsolutePathBuf::try_from(cwd.as_path())?),
                                     parsed_cmd: vec![ParsedCommand::Unknown {
                                         cmd: "sleep 60".into(),
                                     }],
@@ -381,6 +399,8 @@ impl CodexThreadImpl for StubCodexThread {
                         send(EventMsg::TurnComplete(TurnCompleteEvent {
                             last_agent_message: Some("Session title sync is fixed.".into()),
                             turn_id,
+                            error: None,
+                            started_at: None,
                             completed_at: None,
                             duration_ms: None,
                             time_to_first_token_ms: None,
@@ -404,11 +424,13 @@ impl CodexThreadImpl for StubCodexThread {
                             status: "completed".into(),
                             revised_prompt: Some("A tiny blue square".into()),
                             result: "Zm9v".into(),
-                            saved_path: Some(saved_path.try_into()?),
+                            saved_path: Some(AbsolutePathBuf::try_from(saved_path.as_path())?),
                         }));
                         send(EventMsg::TurnComplete(TurnCompleteEvent {
                             last_agent_message: None,
                             turn_id,
+                            error: None,
+                            started_at: None,
                             completed_at: None,
                             duration_ms: None,
                             time_to_first_token_ms: None,
@@ -441,6 +463,8 @@ impl CodexThreadImpl for StubCodexThread {
                                 msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                     last_agent_message: None,
                                     turn_id,
+                                    error: None,
+                                    started_at: None,
                                     completed_at: None,
                                     duration_ms: None,
                                     time_to_first_token_ms: None,
@@ -465,6 +489,8 @@ impl CodexThreadImpl for StubCodexThread {
                                 msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                     last_agent_message: None,
                                     turn_id,
+                                    error: None,
+                                    started_at: None,
                                     completed_at: None,
                                     duration_ms: None,
                                     time_to_first_token_ms: None,
@@ -519,6 +545,8 @@ impl CodexThreadImpl for StubCodexThread {
                                 msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                     last_agent_message: None,
                                     turn_id,
+                                    error: None,
+                                    started_at: None,
                                     completed_at: None,
                                     duration_ms: None,
                                     time_to_first_token_ms: None,
@@ -531,11 +559,17 @@ impl CodexThreadImpl for StubCodexThread {
                                 id: id.to_string(),
                                 msg: EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
                                     call_id: "call-id".to_string(),
+                                    environment_id: None,
+                                    plugin_id: None,
+                                    script_path: None,
                                     approval_id: Some("approval-id".to_string()),
                                     turn_id: id.to_string(),
                                     started_at_ms: 0,
                                     command: vec!["echo".to_string(), "hi".to_string()],
-                                    cwd: std::env::current_dir().unwrap().try_into().unwrap(),
+                                    cwd: AbsolutePathBuf::try_from(
+                                        std::env::current_dir().unwrap().as_path(),
+                                    )
+                                    .unwrap(),
                                     reason: None,
                                     network_approval_context: None,
                                     proposed_execpolicy_amendment: None,
@@ -598,6 +632,8 @@ impl CodexThreadImpl for StubCodexThread {
                                 msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                     last_agent_message: None,
                                     turn_id: id.to_string(),
+                                    error: None,
+                                    started_at: None,
                                     completed_at: None,
                                     duration_ms: None,
                                     time_to_first_token_ms: None,
@@ -643,6 +679,8 @@ impl CodexThreadImpl for StubCodexThread {
                             msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
                                 turn_id: id.to_string(),
+                                error: None,
+                                started_at: None,
                                 completed_at: None,
                                 duration_ms: None,
                                 time_to_first_token_ms: None,
@@ -654,13 +692,20 @@ impl CodexThreadImpl for StubCodexThread {
                     self.op_tx
                         .send(Event {
                             id: id.to_string(),
-                            msg: EventMsg::EnteredReviewMode(review_request.clone()),
+                            msg: EventMsg::EnteredReviewMode(EnteredReviewModeEvent {
+                                target: review_request.target.clone(),
+                                user_facing_hint: review_request.user_facing_hint.clone(),
+                                turn_id: None,
+                                item_id: None,
+                            }),
                         })
                         .unwrap();
                     self.op_tx
                         .send(Event {
                             id: id.to_string(),
                             msg: EventMsg::ExitedReviewMode(ExitedReviewModeEvent {
+                                turn_id: None,
+                                item_id: None,
                                 review_output: Some(ReviewOutputEvent {
                                     findings: vec![],
                                     overall_correctness: String::new(),
@@ -679,6 +724,8 @@ impl CodexThreadImpl for StubCodexThread {
                             msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
                                 turn_id: id.to_string(),
+                                error: None,
+                                started_at: None,
                                 completed_at: None,
                                 duration_ms: None,
                                 time_to_first_token_ms: None,
@@ -700,7 +747,7 @@ impl CodexThreadImpl for StubCodexThread {
                     // `Denied` keeps the turn alive (codex
                     // `notify_approval`); remember the active turn so the
                     // guidance follow-up can model steering into it.
-                    if matches!(decision, ReviewDecision::Denied)
+                    if matches!(decision, ReviewDecision::Denied { .. })
                         && let Some(active) =
                             self.active_prompt_id.lock().unwrap().take()
                     {
@@ -710,7 +757,7 @@ impl CodexThreadImpl for StubCodexThread {
                 Op::PatchApproval { decision, .. } => {
                     // `Denied` keeps the turn alive (codex
                     // `notify_approval`); same as `ExecApproval` above.
-                    if matches!(decision, ReviewDecision::Denied)
+                    if matches!(decision, ReviewDecision::Denied { .. })
                         && let Some(active) =
                             self.active_prompt_id.lock().unwrap().take()
                     {
@@ -731,6 +778,7 @@ impl CodexThreadImpl for StubCodexThread {
                                 msg: EventMsg::TurnAborted(TurnAbortedEvent {
                                     turn_id: Some(active_prompt_id),
                                     reason: codex_protocol::protocol::TurnAbortReason::Interrupted,
+                                    started_at: None,
                                     completed_at: None,
                                     duration_ms: None,
                                 }),
@@ -921,6 +969,7 @@ fn codex_usage_meta_includes_full_breakdown_without_cost() {
     let last = TokenUsage {
         input_tokens: 100,
         cached_input_tokens: 40,
+        cache_write_input_tokens: 0,
         output_tokens: 30,
         reasoning_output_tokens: 10,
         total_tokens: 130,
@@ -928,6 +977,7 @@ fn codex_usage_meta_includes_full_breakdown_without_cost() {
     let total = TokenUsage {
         input_tokens: 500,
         cached_input_tokens: 200,
+        cache_write_input_tokens: 0,
         output_tokens: 150,
         reasoning_output_tokens: 50,
         total_tokens: 650,

@@ -1,33 +1,41 @@
-use acp::schema::{
+use acp::schema::v1::{
     AgentAuthCapabilities, AgentCapabilities, AuthEnvVar, AuthMethod, AuthMethodAgent,
     AuthMethodEnvVar, AuthMethodId, AuthenticateRequest, AuthenticateResponse, CancelNotification,
     ClientCapabilities, CloseSessionRequest, CloseSessionResponse, Implementation,
     InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
     LoadSessionRequest, LoadSessionResponse, LogoutCapabilities, LogoutRequest, LogoutResponse,
     McpCapabilities, McpServer, McpServerHttp, McpServerStdio, NewSessionRequest,
-    NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion,
+    NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
     SessionCapabilities, SessionCloseCapabilities, SessionId, SessionInfo, SessionListCapabilities,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
+    SetSessionModeResponse,
 };
 use acp::{Agent, Client, ConnectTo, ConnectionTo, Error, JsonRpcNotification};
 use agent_client_protocol as acp;
-use codex_config::{DEFAULT_MCP_SERVER_ENVIRONMENT_ID, McpServerConfig, McpServerTransportConfig};
+use acp::schema::ProtocolVersion;
+use codex_config::{
+    DEFAULT_MCP_SERVER_ENVIRONMENT_ID, McpServerAuth, McpServerConfig, McpServerTransportConfig,
+};
+use codex_utils_path_uri::LegacyAppPathString;
 use codex_core::{
-    NewThread, RolloutRecorder, SortDirection, StateDbHandle, ThreadManager, ThreadSortKey,
-    config::Config, find_thread_names_by_ids, find_thread_path_by_id_str, init_state_db,
+    CodexAppsToolsCache, NewThread, RolloutRecorder, SortDirection, StateDbHandle, ThreadManager,
+    ThreadSortKey, build_models_manager, config::Config, find_thread_names_by_ids,
+    find_thread_path_by_id_str, init_state_db, local_agent_graph_store_from_state_db,
     parse_cursor, resolve_installation_id, thread_store_from_config,
 };
 use codex_exec_server::{EnvironmentManager, ExecServerRuntimePaths};
-use codex_extension_api::empty_extension_registry;
+use codex_extension_api::{
+    empty_extension_registry, LoadUserInstructionsFuture, LoadedUserInstructions,
+    UserInstructionsProvider,
+};
 use codex_features::Feature;
 use codex_login::{
-    CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR,
+    AuthKeyringBackendKind, AuthRouteConfig, CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR,
     auth::{AuthManager, CodexAuth, read_codex_api_key_from_env, read_openai_api_key_from_env},
 };
 use codex_protocol::{
     ThreadId,
-    protocol::{InitialHistory, McpServerRefreshConfig, SessionSource},
+    protocol::{InitialHistory, SessionSource},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -38,6 +46,14 @@ use std::{
 use tracing::{debug, info};
 
 use crate::thread::Thread;
+
+struct EmptyUserInstructionsProvider;
+
+impl UserInstructionsProvider for EmptyUserInstructionsProvider {
+    fn load_user_instructions(&self) -> LoadUserInstructionsFuture<'_> {
+        Box::pin(async { LoadedUserInstructions::default() })
+    }
+}
 
 /// The Codex implementation of the ACP Agent.
 ///
@@ -142,6 +158,7 @@ fn client_mcp_server_config(
                         },
                         env_http_headers: None,
                     },
+                    auth: McpServerAuth::default(),
                     environment_id: DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
                     required,
                     enabled: true,
@@ -180,8 +197,9 @@ fn client_mcp_server_config(
                             Some(env.into_iter().map(|env| (env.name, env.value)).collect())
                         },
                         env_vars: vec![],
-                        cwd: Some(cwd.to_path_buf()),
+                        cwd: Some(LegacyAppPathString::from_path(cwd)),
                     },
+                    auth: McpServerAuth::default(),
                     environment_id: DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
                     required,
                     enabled: true,
@@ -209,11 +227,16 @@ impl CodexAgent {
         config: Config,
         codex_linux_sandbox_exe: Option<PathBuf>,
     ) -> std::io::Result<Self> {
+        let auth_route_config =
+            AuthRouteConfig::from_http_client_factory(config.http_client_factory());
         let auth_manager = AuthManager::shared(
             config.codex_home.to_path_buf(),
             false,
             config.cli_auth_credentials_store_mode,
+            None,
             Some(config.chatgpt_base_url.clone()),
+            AuthKeyringBackendKind::default(),
+            auth_route_config,
         )
         .await;
 
@@ -223,22 +246,31 @@ impl CodexAgent {
         let local_runtime_paths =
             ExecServerRuntimePaths::new(std::env::current_exe()?, codex_linux_sandbox_exe)?;
         let environment_manager = Arc::new(
-            EnvironmentManager::from_codex_home(&config.codex_home, Some(local_runtime_paths))
-                .await
-                .map_err(std::io::Error::other)?,
+            EnvironmentManager::from_codex_home(
+                &config.codex_home,
+                Some(local_runtime_paths),
+                config.http_client_factory(),
+            )
+            .await
+            .map_err(std::io::Error::other)?,
         );
         let thread_store = thread_store_from_config(&config, state_db.clone());
         let installation_id = resolve_installation_id(&config.codex_home).await?;
+        let user_instructions_provider = Arc::new(EmptyUserInstructionsProvider);
         let thread_manager = ThreadManager::new(
             &config,
             auth_manager.clone(),
+            build_models_manager(&config, auth_manager.clone()),
+            CodexAppsToolsCache::default(),
             SessionSource::Unknown,
             environment_manager,
             empty_extension_registry(),
+            user_instructions_provider,
             None,
             thread_store,
-            state_db.clone(),
+            local_agent_graph_store_from_state_db(state_db.as_ref()),
             installation_id,
+            None,
             None,
         );
         Ok(Self {
@@ -438,21 +470,6 @@ impl CodexAgent {
             .on_receive_request(
                 {
                     let agent = agent.clone();
-                    async move |request: SetSessionModelRequest,
-                                responder,
-                                cx: ConnectionTo<Client>| {
-                        let agent = agent.clone();
-                        cx.spawn(async move {
-                            responder.respond_with_result(agent.set_session_model(request).await)
-                        })?;
-                        Ok(())
-                    }
-                },
-                acp::on_receive_request!(),
-            )
-            .on_receive_request(
-                {
-                    let agent = agent.clone();
                     async move |request: SetSessionConfigOptionRequest,
                                 responder,
                                 cx: ConnectionTo<Client>| {
@@ -539,23 +556,6 @@ impl CodexAgent {
         Ok(config)
     }
 
-    async fn build_mcp_server_refresh_config(
-        &self,
-        config: &Config,
-    ) -> Result<McpServerRefreshConfig, Error> {
-        let mcp_servers = self
-            .thread_manager
-            .mcp_manager()
-            .configured_servers(config)
-            .await;
-        Ok(McpServerRefreshConfig {
-            mcp_servers: serde_json::to_value(mcp_servers).map_err(Error::into_internal_error)?,
-            mcp_oauth_credentials_store_mode: serde_json::to_value(
-                config.mcp_oauth_credentials_store_mode,
-            )
-            .map_err(Error::into_internal_error)?,
-        })
-    }
 }
 
 impl CodexAgent {
@@ -617,6 +617,10 @@ impl CodexAgent {
                     codex_login::auth::CLIENT_ID.to_string(),
                     None,
                     self.config.cli_auth_credentials_store_mode,
+                    AuthKeyringBackendKind::default(),
+                    AuthRouteConfig::from_http_client_factory(
+                        self.config.http_client_factory(),
+                    ),
                 );
 
                 let server =
@@ -635,6 +639,7 @@ impl CodexAgent {
                     &self.config.codex_home,
                     &api_key,
                     self.config.cli_auth_credentials_store_mode,
+                    AuthKeyringBackendKind::default(),
                 )
                 .map_err(Error::into_internal_error)?;
             }
@@ -646,6 +651,7 @@ impl CodexAgent {
                     &self.config.codex_home,
                     &api_key,
                     self.config.cli_auth_credentials_store_mode,
+                    AuthKeyringBackendKind::default(),
                 )
                 .map_err(Error::into_internal_error)?;
             }
@@ -684,7 +690,9 @@ impl CodexAgent {
             thread_id,
             thread,
             session_configured: _,
-        } = Box::pin(self.thread_manager.start_thread(config.clone()))
+        } = Box::pin(self.thread_manager.start_thread(
+            codex_core::StartThreadOptions::new(config.clone()),
+        ))
             .await
             .map_err(|_e| Error::internal_error())?;
 
@@ -703,9 +711,7 @@ impl CodexAgent {
             config.clone(),
             cx,
         ));
-        thread
-            .refresh_mcp_servers(self.build_mcp_server_refresh_config(&config).await?)
-            .await?;
+        thread.refresh_mcp_servers().await?;
         let load = thread.load().await?;
 
         self.sessions
@@ -717,7 +723,6 @@ impl CodexAgent {
 
         Ok(NewSessionResponse::new(session_id)
             .modes(load.modes)
-            .models(load.models)
             .config_options(load.config_options))
     }
 
@@ -751,7 +756,7 @@ impl CodexAgent {
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
         let rollout_items = match &history {
-            InitialHistory::Resumed(resumed) => resumed.history.clone(),
+            InitialHistory::Resumed(resumed) => resumed.history.as_ref().clone(),
             InitialHistory::Forked(items) => items.clone(),
             InitialHistory::Cleared | InitialHistory::New => Vec::new(),
         };
@@ -767,6 +772,7 @@ impl CodexAgent {
             rollout_path,
             self.auth_manager.clone(),
             None,
+            false,
         ))
         .await
         .map_err(|e| Error::internal_error().data(e.to_string()))?;
@@ -781,9 +787,7 @@ impl CodexAgent {
             cx,
         ));
 
-        thread
-            .refresh_mcp_servers(self.build_mcp_server_refresh_config(&config).await?)
-            .await?;
+        thread.refresh_mcp_servers().await?;
 
         thread.replay_history(rollout_items).await?;
 
@@ -797,7 +801,6 @@ impl CodexAgent {
 
         Ok(LoadSessionResponse::new()
             .modes(load.modes)
-            .models(load.models)
             .config_options(load.config_options))
     }
 
@@ -961,19 +964,6 @@ impl CodexAgent {
             .set_mode(args.mode_id)
             .await?;
         Ok(SetSessionModeResponse::default())
-    }
-
-    async fn set_session_model(
-        &self,
-        args: SetSessionModelRequest,
-    ) -> Result<SetSessionModelResponse, Error> {
-        info!("Setting session model for session: {}", args.session_id);
-
-        self.get_thread(&args.session_id)?
-            .set_model(args.model_id)
-            .await?;
-
-        Ok(SetSessionModelResponse::default())
     }
 
     async fn set_session_config_option(

@@ -330,7 +330,9 @@ impl PromptState {
                     if matches!(selected_decision, ReviewDecision::Abort)
                         && permission_guidance.is_some()
                     {
-                        ReviewDecision::Denied
+                        ReviewDecision::Denied {
+                            rejection: "denied".to_string(),
+                        }
                     } else {
                         selected_decision.clone()
                     };
@@ -367,7 +369,9 @@ impl PromptState {
                     if matches!(selected_decision, ReviewDecision::Abort)
                         && permission_guidance.is_some()
                     {
-                        ReviewDecision::Denied
+                        ReviewDecision::Denied {
+                            rejection: "denied".to_string(),
+                        }
                     } else {
                         selected_decision.clone()
                     };
@@ -551,6 +555,15 @@ impl PromptState {
         }
 
         match event {
+            EventMsg::TurnModerationMetadata(_)
+            | EventMsg::SafetyBuffering(_)
+            | EventMsg::EnvironmentConnected(_)
+            | EventMsg::EnvironmentDisconnected(_)
+            | EventMsg::SessionConfigured(_)
+            | EventMsg::RawResponseCompleted(_)
+            | EventMsg::SubAgentActivity(_) => {
+                // New in codex 0.146; nothing to surface in the ACP timeline.
+            }
             EventMsg::TurnStarted(TurnStartedEvent {
                 model_context_window,
                 collaboration_mode_kind,
@@ -930,7 +943,7 @@ impl PromptState {
             }
             EventMsg::ViewImageToolCall(ViewImageToolCallEvent { call_id, path, .. }) => {
                 info!("ViewImageToolCallEvent received");
-                let display_path = path.display().to_string();
+                let display_path = path.inferred_native_path_string();
                 client.send_notification(
                     SessionUpdate::ToolCall(
                         ToolCall::new(call_id, format!("View Image {display_path}"))
@@ -938,7 +951,7 @@ impl PromptState {
                             .content(vec![ToolCallContent::Content(Content::new(ContentBlock::ResourceLink(ResourceLink::new(display_path.clone(), display_path.clone())
                         )
                     )
-                )]).locations(vec![ToolCallLocation::new(path)])));
+                )]).locations(vec![ToolCallLocation::new(path.to_path_buf())])));
             }
             EventMsg::EnteredReviewMode(review_request) => {
                 info!("Review begin: request={review_request:?}");

@@ -9,16 +9,16 @@ use std::{
 
 use agent_client_protocol::{
     Client, ConnectionTo, Error,
-    schema::{
+    schema::v1::{
         AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, ClientCapabilities,
         ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Diff, EmbeddedResource,
-        EmbeddedResourceResource, ImageContent, LoadSessionResponse, Meta, ModelId, ModelInfo,
-        PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
+        EmbeddedResourceResource, ImageContent, LoadSessionResponse, Meta, PermissionOption,
+        PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
         PlanEntryStatus, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
         RequestPermissionResponse, ResourceLink, SelectedPermissionOutcome, SessionConfigId,
         SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
         SessionConfigSelectOption, SessionConfigValueId, SessionId, SessionInfoUpdate, SessionMode,
-        SessionModeId, SessionModeState, SessionModelState, SessionNotification, SessionUpdate,
+        SessionModeId, SessionModeState, SessionNotification, SessionUpdate,
         StopReason, Terminal, TextContent, TextResourceContents, ToolCall, ToolCallContent,
         ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
         ToolKind, UnstructuredCommandInput, UsageUpdate,
@@ -29,10 +29,10 @@ use codex_core::{
     CodexThread, ModelClient, Prompt, ResponseEvent,
     config::{Config, set_project_trust_level},
     resolve_installation_id,
-    review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
 };
-use codex_login::auth::AuthManager;
+use codex_http_client::{HttpClientFactory, OutboundProxyPolicy};
+use codex_login::{AgentIdentityAuthPolicy, auth::AuthManager};
 use codex_models_manager::manager::{ModelsManager, RefreshStrategy};
 use codex_otel::SessionTelemetry;
 use codex_protocol::{
@@ -62,10 +62,11 @@ use codex_protocol::{
         AgentReasoningRawContentEvent, AgentReasoningSectionBreakEvent,
         ApplyPatchApprovalRequestEvent, DynamicToolCallResponseEvent, ElicitationAction,
         ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent,
-        ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandStatus, ExitedReviewModeEvent,
-        FileChange, GuardianAssessmentEvent, GuardianAssessmentStatus, ImageGenerationBeginEvent,
+        ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandStatus,
+        EnteredReviewModeEvent, ExitedReviewModeEvent, FileChange, GuardianAssessmentEvent,
+        GuardianAssessmentStatus, ImageGenerationBeginEvent,
         ImageGenerationEndEvent, ItemCompletedEvent, ItemStartedEvent, McpInvocation,
-        McpServerRefreshConfig, McpStartupCompleteEvent, McpStartupUpdateEvent,
+        McpStartupCompleteEvent, McpStartupUpdateEvent,
         McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent, NetworkApprovalContext,
         NetworkPolicyRuleAction, Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus,
         PatchApplyUpdatedEvent, ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent,
@@ -83,6 +84,7 @@ use codex_protocol::{
         RequestUserInputAnswer, RequestUserInputEvent, RequestUserInputQuestion,
         RequestUserInputResponse,
     },
+    review_format::format_review_findings_block,
     user_input::UserInput,
 };
 use codex_rollout_trace::InferenceTraceContext;
@@ -104,6 +106,71 @@ mod permissions;
 mod prompt_state;
 mod session_config;
 mod title;
+
+/// ACP 2.0 replaced the v0.x session-model messages with a provider model, so
+/// these session-model types no longer exist in `agent-client-protocol`. They
+/// are kept locally to support the internal model picker / set-model flow that
+/// `KODEX_MODEL_PROVIDER_MAP_ENV` configures.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(super) struct ModelId(pub(super) String);
+
+impl ModelId {
+    pub(super) fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+}
+
+impl std::fmt::Display for ModelId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(super) struct ModelInfo {
+    pub(super) id: ModelId,
+    pub(super) name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) meta: Option<Meta>,
+}
+
+impl ModelInfo {
+    pub(super) fn new(id: ModelId, name: String) -> Self {
+        Self {
+            id,
+            name,
+            description: None,
+            meta: None,
+        }
+    }
+
+    pub(super) fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    pub(super) fn meta(mut self, meta: Meta) -> Self {
+        self.meta = Some(meta);
+        self
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(super) struct SessionModelState {
+    pub(super) current_model_id: ModelId,
+    pub(super) available_models: Vec<ModelInfo>,
+}
+
+impl SessionModelState {
+    pub(super) fn new(current_model_id: ModelId, available_models: Vec<ModelInfo>) -> Self {
+        Self {
+            current_model_id,
+            available_models,
+        }
+    }
+}
 
 use actor::ThreadActor;
 use event_mapping::{
@@ -391,9 +458,9 @@ impl Thread {
             .map_err(|e| Error::internal_error().data(e.to_string()))?
     }
 
-    pub async fn refresh_mcp_servers(&self, config: McpServerRefreshConfig) -> Result<(), Error> {
+    pub async fn refresh_mcp_servers(&self) -> Result<(), Error> {
         self.thread
-            .submit(Op::RefreshMcpServers { config })
+            .submit(Op::RefreshMcpServers)
             .await
             .map(|_| ())
             .map_err(|e| Error::internal_error().data(e.to_string()))

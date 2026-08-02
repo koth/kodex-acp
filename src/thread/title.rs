@@ -86,8 +86,13 @@ impl ModelsManagerImpl for Arc<dyn ModelsManager> {
     ) -> Pin<Box<dyn Future<Output = String> + Send + '_>> {
         let model_id = model_id.clone();
         Box::pin(async move {
-            self.get_default_model(&model_id, RefreshStrategy::OnlineIfUncached)
-                .await
+            self.get_default_model(
+                &model_id,
+                /*allow_provider_model_fallback*/ false,
+                RefreshStrategy::OnlineIfUncached,
+                HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+            )
+            .await
         })
     }
 
@@ -105,7 +110,12 @@ impl ModelsManagerImpl for Arc<dyn ModelsManager> {
 
     fn list_models(&self) -> Pin<Box<dyn Future<Output = Vec<ModelPreset>> + Send + '_>> {
         Box::pin(async move {
-            ModelsManager::list_models(self.as_ref(), RefreshStrategy::OnlineIfUncached).await
+            ModelsManager::list_models(
+                self.as_ref(),
+                RefreshStrategy::OnlineIfUncached,
+                HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+            )
+            .await
         })
     }
 }
@@ -158,19 +168,20 @@ impl SessionTitleGenerator for ModelSessionTitleGenerator {
                 .models_manager
                 .get_model_info(&model, &self.config)
                 .await;
-            let installation_id = resolve_installation_id(&self.config.codex_home).await?;
             let model_client = ModelClient::new(
                 Some(self.auth.clone()),
-                codex_session_id,
+                AgentIdentityAuthPolicy::JwtOnly,
                 thread_id,
-                installation_id,
                 self.config.model_provider.clone(),
                 SessionSource::Custom("codex-acp-title".to_string()),
+                "codex-acp".to_string(),
                 self.config.model_verbosity,
                 /*enable_request_compression*/ false,
                 /*include_timing_metrics*/ false,
                 /*beta_features_header*/ None,
+                /*concurrent_reasoning_summaries_enabled*/ false,
                 /*attestation_provider*/ None,
+                self.config.http_client_factory(),
             );
 
             let telemetry = SessionTelemetry::new(
@@ -194,9 +205,20 @@ impl SessionTitleGenerator for ModelSessionTitleGenerator {
                     text: build_session_title_prompt(&prompt_text, response_text.as_deref()),
                 }],
                 phase: None,
+                internal_chat_message_metadata_passthrough: None,
             }];
 
             let mut session = model_client.new_session();
+            let responses_metadata = codex_core::detached_memory_responses_metadata(
+                resolve_installation_id(&self.config.codex_home).await?,
+                codex_session_id.to_string(),
+                thread_id.to_string(),
+                "codex-acp".to_string(),
+                &SessionSource::Custom("codex-acp-title".to_string()),
+                &self.config.cwd,
+                None,
+            )
+            .await;
             let mut stream = session
                 .stream(
                     &prompt,
@@ -205,7 +227,7 @@ impl SessionTitleGenerator for ModelSessionTitleGenerator {
                     /*effort*/ None,
                     ReasoningSummary::None,
                     self.config.service_tier.clone(),
-                    /*turn_metadata_header*/ None,
+                    &responses_metadata,
                     &InferenceTraceContext::disabled(),
                 )
                 .await?;

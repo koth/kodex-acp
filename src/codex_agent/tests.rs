@@ -5,7 +5,7 @@ use super::{
     build_agent_capabilities, client_mcp_server_config, distinct_session_title,
     merge_kodex_developer_instructions,
 };
-use agent_client_protocol::schema::{McpServer, McpServerHttp};
+use agent_client_protocol::schema::v1::{McpServer, McpServerHttp};
 use codex_config::McpServerTransportConfig;
 use std::path::Path;
 

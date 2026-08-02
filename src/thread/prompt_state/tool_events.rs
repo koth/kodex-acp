@@ -80,6 +80,7 @@ impl PromptState {
         let request_kind = match &request {
             ElicitationRequest::Form { .. } => "form",
             ElicitationRequest::Url { .. } => "url",
+            ElicitationRequest::OpenAiForm { .. } => "openai_form",
         };
 
         info!(
@@ -106,7 +107,9 @@ impl PromptState {
         client: &SessionClient,
         event: ExitedReviewModeEvent,
     ) -> Result<(), Error> {
-        let ExitedReviewModeEvent { review_output } = event;
+        let ExitedReviewModeEvent {
+            review_output, ..
+        } = event;
         let Some(ReviewOutputEvent {
             findings,
             overall_correctness: _,
@@ -357,6 +360,11 @@ impl PromptState {
                                     ResourceLink::new(image_url.clone(), image_url),
                                 )))
                             }
+                            DynamicToolCallOutputContentItem::InputAudio { .. } => {
+                                ToolCallContent::Content(Content::new(
+                                    "[audio output]".to_string(),
+                                ))
+                            }
                         })
                         .chain(error.map(|e| ToolCallContent::Content(Content::new(e))))
                         .collect::<Vec<_>>(),
@@ -442,7 +450,7 @@ impl PromptState {
             file_extension,
             locations,
             kind,
-        } = parse_command_tool_call(parsed_cmd, &cwd);
+        } = parse_command_tool_call(parsed_cmd, &cwd.to_path_buf());
         self.active_commands.insert(
             call_id.clone(),
             ActiveCommand {
@@ -560,7 +568,7 @@ impl PromptState {
             locations,
             terminal_output,
             kind,
-        } = parse_command_tool_call(parsed_cmd, &cwd);
+        } = parse_command_tool_call(parsed_cmd, &cwd.to_path_buf());
 
         let active_command = ActiveCommand {
             tool_call_id: tool_call_id.clone(),
@@ -972,6 +980,7 @@ impl PromptState {
             call_id,
             turn_id,
             questions,
+            ..
         } = event;
         let answer_id = if turn_id.trim().is_empty() {
             self.submission_id.clone()

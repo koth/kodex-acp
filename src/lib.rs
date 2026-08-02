@@ -1,8 +1,9 @@
 //! Codex ACP - An Agent Client Protocol implementation for Codex.
+#![recursion_limit = "1024"]
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 use agent_client_protocol::ByteStreams;
-use agent_client_protocol::schema::SessionId;
+use agent_client_protocol::schema::v1::SessionId;
 use codex_core::config::{Config, ConfigOverrides};
 use codex_utils_cli::CliConfigOverrides;
 use serde::{Deserialize, Serialize};
@@ -174,7 +175,7 @@ mod tests_shell_safety {
     //! commands to the host permission broker. These cover the argv shapes
     //! that `commands_for_exec_policy` actually feeds to
     //! `command_might_be_dangerous` after heredoc/redirect parsing.
-    use codex_shell_command::is_dangerous_command::command_might_be_dangerous;
+    use codex_shell_command::is_dangerous_command::dangerous_command_match;
 
     fn argv(items: &[&str]) -> Vec<String> {
         items.iter().map(ToString::to_string).collect()
@@ -185,43 +186,45 @@ mod tests_shell_safety {
         // `python3 - <<'PY' ... Path(...).write_text(...) ... PY` parses down
         // to `["python3", "-"]` (the heredoc body is stripped); this must be
         // routed to the broker, which sees the full body.
-        assert!(command_might_be_dangerous(&argv(&["python3", "-"])));
-        assert!(command_might_be_dangerous(&argv(&["python", "-"])));
+        assert!(dangerous_command_match(&argv(&["python3", "-"])).is_some());
+        assert!(dangerous_command_match(&argv(&["python", "-"])).is_some());
     }
 
     #[test]
     fn python_inline_script_routes_to_broker() {
-        assert!(command_might_be_dangerous(&argv(&["python3", "-c", "print(1)"])));
-        assert!(command_might_be_dangerous(&argv(&["node", "-e", "console.log(1)"])));
+        assert!(dangerous_command_match(&argv(&["python3", "-c", "print(1)"])).is_some());
+        assert!(dangerous_command_match(&argv(&["node", "-e", "console.log(1)"])).is_some());
     }
 
     #[test]
     fn python_running_a_script_file_is_not_routed() {
-        assert!(!command_might_be_dangerous(&argv(&["python3", "scripts/build.py"])));
+        assert!(dangerous_command_match(&argv(&["python3", "scripts/build.py"])).is_none());
     }
 
     #[test]
     fn shell_redirection_routes_to_broker() {
-        assert!(command_might_be_dangerous(&argv(&[
+        assert!(dangerous_command_match(&argv(&[
             "/bin/zsh", "-lc", "echo hi > src/main.rs"
-        ])));
-        assert!(!command_might_be_dangerous(&argv(&["ls", "2>", "/dev/null"])));
+        ]))
+        .is_some());
+        assert!(dangerous_command_match(&argv(&["ls", "2>", "/dev/null"])).is_none());
     }
 
     #[test]
     fn file_mutation_primitives_route_to_broker() {
-        assert!(command_might_be_dangerous(&argv(&["tee", "file.txt"])));
-        assert!(command_might_be_dangerous(&argv(&["sed", "-i", "s/a/b/", "file.rs"])));
-        assert!(!command_might_be_dangerous(&argv(&["sed", "s/a/b/", "file.rs"])));
+        assert!(dangerous_command_match(&argv(&["tee", "file.txt"])).is_some());
+        assert!(dangerous_command_match(&argv(&["sed", "-i", "s/a/b/", "file.rs"])).is_some());
+        assert!(dangerous_command_match(&argv(&["sed", "s/a/b/", "file.rs"])).is_none());
     }
 
     #[test]
     fn apply_patch_and_benign_commands_are_not_routed() {
-        assert!(!command_might_be_dangerous(&argv(&[
+        assert!(dangerous_command_match(&argv(&[
             "apply_patch", "<<'PATCH'", "*** Begin Patch", "*** End Patch", "PATCH"
-        ])));
-        assert!(!command_might_be_dangerous(&argv(&["cargo", "build"])));
-        assert!(!command_might_be_dangerous(&argv(&["rg", "foo", "src"])));
-        assert!(!command_might_be_dangerous(&argv(&["git", "status"])));
+        ]))
+        .is_none());
+        assert!(dangerous_command_match(&argv(&["cargo", "build"])).is_none());
+        assert!(dangerous_command_match(&argv(&["rg", "foo", "src"])).is_none());
+        assert!(dangerous_command_match(&argv(&["git", "status"])).is_none());
     }
 }
