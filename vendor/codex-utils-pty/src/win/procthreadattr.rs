@@ -75,7 +75,7 @@ impl ProcThreadAttributeList {
         unsafe {
             self.update(
                 PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-                con,
+                con.cast(),
                 mem::size_of::<HPCON>(),
             )
         }
