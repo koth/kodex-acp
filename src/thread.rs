@@ -66,7 +66,7 @@ use codex_protocol::{
         EnteredReviewModeEvent, ExitedReviewModeEvent, FileChange, GuardianAssessmentEvent,
         GuardianAssessmentStatus, ImageGenerationBeginEvent,
         ImageGenerationEndEvent, ItemCompletedEvent, ItemStartedEvent, McpInvocation,
-        McpStartupCompleteEvent, McpStartupUpdateEvent,
+        McpStartupCompleteEvent, McpStartupStatus, McpStartupUpdateEvent,
         McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent, NetworkApprovalContext,
         NetworkPolicyRuleAction, Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus,
         PatchApplyUpdatedEvent, ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent,

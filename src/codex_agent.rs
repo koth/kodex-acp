@@ -521,13 +521,29 @@ impl CodexAgent {
     ) -> Result<Config, Error> {
         let mut config = self.config.clone();
         config.cwd = cwd.try_into().map_err(Error::into_internal_error)?;
-        let dbg = format!("[codex-acp] build_session_config model={:?} catalog_loaded={} catalog_models={}\n",
+        let mcp_servers_dbg = if mcp_servers.is_empty() {
+            "none".to_string()
+        } else {
+            mcp_servers
+                .iter()
+                .map(|server| match server {
+                    McpServer::Http(server) => format!("http:{}", server.name),
+                    McpServer::Stdio(server) => format!("stdio:{}", server.name),
+                    _ => "<unsupported>".to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        crate::append_codex_acp_debug_log(&format!(
+            "[codex-acp] build_session_config model={:?} catalog_loaded={} catalog_models={} mcp_servers=[{mcp_servers_dbg}]\n",
             config.model,
             config.model_catalog.is_some(),
-            config.model_catalog.as_ref().map(|c| c.models.len()).unwrap_or(0));
-        let _ = std::fs::OpenOptions::new().create(true).append(true)
-            .open(std::path::Path::new(&std::env::var_os("HOME").unwrap_or_default()).join(".kodex/logs/codex-acp-debug.log"))
-            .and_then(|mut f| std::io::Write::write_all(&mut f, dbg.as_bytes()));
+            config
+                .model_catalog
+                .as_ref()
+                .map(|c| c.models.len())
+                .unwrap_or(0),
+        ));
         config.developer_instructions =
             merge_kodex_developer_instructions(config.developer_instructions);
         config.include_permissions_instructions = false;
