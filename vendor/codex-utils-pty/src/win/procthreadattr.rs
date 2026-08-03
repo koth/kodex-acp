@@ -21,13 +21,13 @@
 use super::psuedocon::HPCON;
 use anyhow::Error;
 use anyhow::ensure;
-use std::ffi::c_void;
 use std::io::Error as IoError;
 use std::mem;
 use std::ptr;
 use winapi::shared::minwindef::DWORD;
 use winapi::um::processthreadsapi::*;
 use winapi::um::winnt::HANDLE;
+use winapi::ctypes::c_void;
 
 const PROC_THREAD_ATTRIBUTE_JOB_LIST: usize = 0x0002000D;
 const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize = 0x00020016;

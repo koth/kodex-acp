@@ -547,8 +547,16 @@ impl CodexAgent {
         config.developer_instructions =
             merge_kodex_developer_instructions(config.developer_instructions);
         config.include_permissions_instructions = false;
-        config.base_instructions =
-            Some(include_str!("codex_agent/base_instructions.md").to_string());
+        let is_codebuddy = config.model_provider_id == "codebuddy"
+            || config.model.as_deref().is_some_and(|model| {
+                model
+                    .strip_prefix("kodex-provider/byok/")
+                    .is_some_and(|rest| rest.split('/').next() == Some("codebuddy"))
+            });
+        if !is_codebuddy {
+            config.base_instructions =
+                Some(include_str!("codex_agent/base_instructions.md").to_string());
+        }
         config
             .features
             .enable(Feature::DefaultModeRequestUserInput)
