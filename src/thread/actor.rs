@@ -408,12 +408,13 @@ impl<A: Auth> ThreadActor<A> {
     async fn handle_set_model(&mut self, model: ModelId) -> Result<(), Error> {
         let raw = model.0.to_string();
         let (selected_provider, model_id) = Self::decode_provider_value(model.0.as_ref());
-        crate::append_codex_acp_debug_log(&format!(
-            "[codex-acp] handle_set_model raw={} decoded=({}, {})\n",
-            raw,
-            selected_provider.as_deref().unwrap_or("<none>"),
-            model_id
-        ));
+        tracing::debug!(
+            target: "codex_acp",
+            raw = %raw,
+            provider = ?selected_provider.as_deref().unwrap_or("<none>"),
+            model = %model_id,
+            "handle_set_model"
+        );
         if let Some(provider) = selected_provider.as_deref() {
             self.set_active_model_provider(provider)?;
         }
@@ -869,9 +870,12 @@ impl<A: Auth> ThreadActor<A> {
                 McpStartupStatus::Failed { error, .. } => format!("failed: {error}"),
                 McpStartupStatus::Cancelled => "cancelled".to_string(),
             };
-            crate::append_codex_acp_debug_log(&format!(
-                "[codex-acp] mcp_startup_update server={server} status={status}\n"
-            ));
+            tracing::debug!(
+                target: "codex_acp",
+                server = %server,
+                status = %status,
+                "mcp_startup_update"
+            );
             true
         } else if let EventMsg::McpStartupComplete(McpStartupCompleteEvent {
             ready,
@@ -885,17 +889,14 @@ impl<A: Auth> ThreadActor<A> {
                 .map(|failure| format!("{}: {}", failure.server, failure.error))
                 .collect::<Vec<_>>()
                 .join("; ");
-            crate::append_codex_acp_debug_log(&format!(
-                "[codex-acp] mcp_startup_complete ready=[{}] failed=[{}] cancelled=[{}] failed_detail=[{}]\n",
-                ready.join(","),
-                failed
-                    .iter()
-                    .map(|f| f.server.as_str())
-                    .collect::<Vec<_>>()
-                    .join(","),
-                cancelled.join(","),
-                failures,
-            ));
+            tracing::debug!(
+                target: "codex_acp",
+                ready = %ready.join(","),
+                failed = %failed.iter().map(|f| f.server.as_str()).collect::<Vec<_>>().join(","),
+                cancelled = %cancelled.join(","),
+                failed_detail = %failures,
+                "mcp_startup_complete"
+            );
             true
         } else {
             false

@@ -18,23 +18,6 @@ mod thread;
 
 const TITLE_HELPER_ENV: &str = "KODEX_CODEX_ACP_TITLE_HELPER";
 
-/// Append a diagnostic line to `~/.kodex/logs/codex-acp-debug.log` (best
-/// effort). Used for persistent agent-side diagnostics that would otherwise
-/// only reach the (non-persisted) process stderr.
-pub(crate) fn append_codex_acp_debug_log(line: &str) {
-    let Some(home) = std::env::var_os("HOME") else {
-        return;
-    };
-    let path = std::path::Path::new(&home).join(".kodex/logs/codex-acp-debug.log");
-    drop(
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .and_then(|mut file| file.write_all(line.as_bytes())),
-    );
-}
-
 #[derive(Deserialize)]
 struct TitleHelperRequest {
     session_id: String,
