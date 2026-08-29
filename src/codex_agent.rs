@@ -1,14 +1,14 @@
 use acp::schema::v1::{
     AgentAuthCapabilities, AgentCapabilities, AuthEnvVar, AuthMethod, AuthMethodAgent,
     AuthMethodEnvVar, AuthMethodId, AuthenticateRequest, AuthenticateResponse, CancelNotification,
-    ClientCapabilities, CloseSessionRequest, CloseSessionResponse, Implementation,
-    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
-    LoadSessionRequest, LoadSessionResponse, LogoutCapabilities, LogoutRequest, LogoutResponse,
-    McpCapabilities, McpServer, McpServerHttp, McpServerStdio, NewSessionRequest,
-    NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
-    SessionCapabilities, SessionCloseCapabilities, SessionId, SessionInfo, SessionListCapabilities,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse,
+    ClientCapabilities, CloseSessionRequest, CloseSessionResponse, ForkSessionRequest,
+    ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
+    LogoutCapabilities, LogoutRequest, LogoutResponse, McpCapabilities, McpServer, McpServerHttp,
+    McpServerStdio, NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest,
+    PromptResponse, SessionCapabilities, SessionCloseCapabilities, SessionForkCapabilities,
+    SessionId, SessionInfo, SessionListCapabilities, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
 };
 use acp::{Agent, Client, ConnectTo, ConnectionTo, Error, JsonRpcNotification};
 use agent_client_protocol as acp;
@@ -18,8 +18,8 @@ use codex_config::{
 };
 use codex_utils_path_uri::LegacyAppPathString;
 use codex_core::{
-    CodexAppsToolsCache, NewThread, RolloutRecorder, SortDirection, StateDbHandle, ThreadManager,
-    ThreadSortKey, build_models_manager, config::Config, find_thread_names_by_ids,
+    CodexAppsToolsCache, ForkSnapshot, NewThread, RolloutRecorder, SortDirection, StateDbHandle,
+    ThreadManager, ThreadSortKey, build_models_manager, config::Config, find_thread_names_by_ids,
     find_thread_path_by_id_str, init_state_db, local_agent_graph_store_from_state_db,
     parse_cursor, resolve_installation_id, thread_store_from_config,
 };
@@ -78,6 +78,10 @@ pub struct CodexAgent {
 
 const SESSION_LIST_PAGE_SIZE: usize = 25;
 const KODEX_TOOL_STOP_METHOD: &str = "kodex.ai/tool_stop";
+/// Kodex `_meta` extension on `session/fork`: the 1-based turn ordinal to keep
+/// through (the seed cut lands at the end of that turn). Absent → the full
+/// committed history.
+const KODEX_FORK_AT_USER_TURN_META: &str = "kodex.ai/at_user_turn";
 const KODEX_WEB_TOOLS_MCP_SERVER_NAME: &str = "kodex-web-tools";
 const KODEX_FILE_EDITING_DEVELOPER_INSTRUCTIONS: &str = r#"File editing rule:
 - Do not directly create, overwrite, append, rename, move, or delete files through shell commands, Python/Node scripts, redirection, here-documents, tee, Set-Content, Remove-Item, mv/cp/rm, or similar filesystem-mutating shell commands.
@@ -371,6 +375,24 @@ impl CodexAgent {
                         cx.spawn(async move {
                             responder
                                 .respond_with_result(agent.load_session(request, session_cx).await)
+                        })?;
+                        Ok(())
+                    }
+                },
+                acp::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let agent = agent.clone();
+                    async move |request: ForkSessionRequest,
+                                responder,
+                                cx: ConnectionTo<Client>| {
+                        let agent = agent.clone();
+                        let session_cx = cx.clone();
+                        cx.spawn(async move {
+                            responder.respond_with_result(
+                                agent.fork_session(request, session_cx).await,
+                            )
                         })?;
                         Ok(())
                     }
@@ -826,6 +848,91 @@ impl CodexAgent {
             .config_options(load.config_options))
     }
 
+    /// Fork a session (`session/fork`): create a new thread seeded with the
+    /// source's committed history. The request may carry a Kodex extension
+    /// `_meta` key `kodex.ai/at_user_turn` (1-based turn ordinal) to cut the
+    /// seed at the end of that turn; without it the full committed history is
+    /// kept.
+    ///
+    /// The forked thread is only materialized (its copied rollout persisted)
+    /// and then parked: Maju opens the child through `session/load` right
+    /// after, which resumes the rollout fresh — keeping the fork-created
+    /// instance live would race the resumed one over the same rollout.
+    async fn fork_session(
+        &self,
+        request: ForkSessionRequest,
+        cx: ConnectionTo<Client>,
+    ) -> Result<ForkSessionResponse, Error> {
+        self.check_auth().await?;
+
+        let ForkSessionRequest {
+            session_id,
+            cwd,
+            mcp_servers,
+            meta,
+            ..
+        } = request;
+        let at_user_turn = meta
+            .as_ref()
+            .and_then(|m| m.get(KODEX_FORK_AT_USER_TURN_META))
+            .and_then(serde_json::Value::as_u64);
+        info!(
+            "Forking session: {} (at_user_turn: {:?})",
+            session_id, at_user_turn
+        );
+
+        let rollout_path = find_thread_path_by_id_str(
+            &self.config.codex_home,
+            session_id.0.as_ref(),
+            self.state_db.as_deref(),
+        )
+        .await
+        .map_err(|e| Error::internal_error().data(e.to_string()))?
+        .ok_or_else(|| Error::resource_not_found(None))?;
+
+        let config = self.build_session_config(&cwd, mcp_servers)?;
+
+        // Snapshot: cut before the nth user message (0-based boundary = keep
+        // turns 1..n) when the client anchored a turn; otherwise keep the full
+        // committed history, interrupting a mid-turn suffix.
+        let snapshot = at_user_turn
+            .map(|turn| ForkSnapshot::from(turn as usize))
+            .unwrap_or(ForkSnapshot::Interrupted);
+
+        let NewThread {
+            thread_id,
+            thread,
+            session_configured: _,
+        } = Box::pin(self.thread_manager.fork_thread(
+            snapshot,
+            config.clone(),
+            rollout_path,
+            None,
+            None,
+        ))
+        .await
+        .map_err(|e| Error::internal_error().data(e.to_string()))?;
+
+        let child_session_id = Self::session_id_from_thread_id(thread_id.clone());
+        // Park the fork-created live thread so the copied rollout is the only
+        // handle on it; `session/load` resumes it as a fresh session.
+        let parked = Arc::new(Thread::new(
+            child_session_id.clone(),
+            thread,
+            self.auth_manager.clone(),
+            Arc::new(self.thread_manager.get_models_manager()),
+            self.client_capabilities.clone(),
+            config,
+            cx,
+        ));
+        if let Err(error) = parked.shutdown().await {
+            tracing::warn!("forked thread shutdown failed: {error}");
+        }
+        self.thread_manager.remove_thread(&thread_id).await;
+
+        Ok(ForkSessionResponse::new(child_session_id))
+    }
+
     async fn list_sessions(
         &self,
         request: ListSessionsRequest,
@@ -1015,7 +1122,8 @@ fn build_agent_capabilities() -> AgentCapabilities {
         .session_capabilities(
             SessionCapabilities::new()
                 .close(SessionCloseCapabilities::new())
-                .list(SessionListCapabilities::new()),
+                .list(SessionListCapabilities::new())
+                .fork(SessionForkCapabilities::new()),
         )
         .auth(AgentAuthCapabilities::new().logout(LogoutCapabilities::new()))
 }
